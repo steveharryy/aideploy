@@ -1,0 +1,33 @@
+{
+  "name": "ai-orchestrator",
+  "version": "1.0.0",
+  "description": "Local AI Development Orchestrator POC",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "dev": "tsx watch src/index.ts",
+    "qa": "tsx src/qa-runner.ts",
+    "clean": "tsx src/clean-repos.ts",
+    "build": "tsc",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "keywords": [
+    "orchestrator",
+    "ai-agent",
+    "code-generation"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.10",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
+

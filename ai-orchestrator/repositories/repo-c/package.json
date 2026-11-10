@@ -1,0 +1,10 @@
+{
+  "name": "repo-c",
+  "version": "1.0.0",
+  "description": "Notification Service Repository",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/test.js"
+  }
+}
+
