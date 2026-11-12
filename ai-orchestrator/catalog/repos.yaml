@@ -1,0 +1,104 @@
+# Service catalog: the single source of truth for repos.
+#
+# Every repo the orchestrator may change is listed here. Routing, deploy order and the
+# verify contract are all read from this file — no code changes needed to add a repo.
+#
+# Fields per repo:
+#   id          unique id (also used as a routing keyword)
+#   path        absolute path, or relative to REPOSITORIES_ROOT (default: the id)
+#   baseBranch  branch ticket branches start from (default: the repo's current HEAD)
+#   keywords    whole-word words / Jira labels / components that route a ticket here
+#   dependsOn   repos that must finish first (deploy order)
+#   verify      commands that must ALL pass (the verify contract), starting with an install/setup
+#               step so dependency changes are installed before tests run. If empty, the
+#               Testing Agent falls back to `make verify`, then `npm test`.
+#   owner, purpose, devUrl, jenkinsJob: documentation for agents and humans
+#
+# The three sample repos below reproduce the orchestrator's built-in routing exactly.
+
+repos:
+  - id: repo-a
+    name: Payment Service
+    purpose: Charges payments and exposes service health.
+    owner: sample
+    keywords: [payment, pay, checkout, charge]
+    modules: [payment-service, server]
+    files: [src/server.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+  - id: repo-b
+    name: Order Service
+    purpose: Creates and tracks orders.
+    owner: sample
+    keywords: [order, cart, fulfillment]
+    modules: [order-service]
+    files: [src/index.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+  - id: repo-c
+    name: Notification Service
+    purpose: Sends email, SMS and push notifications.
+    owner: sample
+    keywords: [notification, email, sms, push]
+    modules: [notification-service]
+    files: [src/index.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+  - id: gb-homepage-api
+    name: GameBull Homepage API (homepage-service)
+    purpose: >-
+      Read-only Express/TypeScript API serving homepage, event, market and SportsBull data from Redis;
+      proxies user activity/exposure to the Match and ATH services.
+    owner: gamebull
+    # Downloaded copy inside repositories/ (not a git clone) -> worked on in place.
+    path: rosstech-gb-homepage-api-service-354e9dc693fa
+    # PRs: active once `path` points to a real git clone and BITBUCKET_* credentials are set.
+    # Repo slug inferred from the download name (rosstech-gb-homepage-api-service-<commit>) — confirm.
+    bitbucket:
+      workspace: rosstech
+      repo: gb-homepage-api-service
+    # baseBranch: develop   # set to the branch PRs should target when the clone is configured
+    keywords:
+      - homepage-service
+      - gb-homepage
+      - rosstech-gb
+      - getExposure
+      - ActivityController
+      - EventController
+      - MarketController
+      - HomePageController
+      - SportsBullController
+      - IpService
+      - buildEventsV2Response
+      - getUserCountry
+    modules: [homepage-service]
+    verify:
+      - name: install
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: typecheck
+        run: npx tsc --noEmit
+      - name: test
+        run: npm test
+
+# Routes that send one ticket to several repos.
+routes:
+  - keywords: [auth, shared, cross-service, all services, all repositories]
+    repos: [repo-a, repo-b]
+    modules: [shared-auth, gateway]
+    files: [repo-a/src/server.ts, repo-b/src/index.ts]

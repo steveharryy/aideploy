@@ -6,3 +6,6 @@ coverage/
 .DS_Store
 .task-history.json
 
+.jobs/
+.worktrees/
+.handoff/

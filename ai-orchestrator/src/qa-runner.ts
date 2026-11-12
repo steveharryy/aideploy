@@ -55,6 +55,12 @@ export const qaTickets: Record<string, TaskInput> = {
       'Payment service charges invoice first',
       'Order service confirms after payment succeeds'
     ]
+  },
+  unroutable: {
+    id: 'UNR-601',
+    title: 'Show creators on the homepage',
+    description: 'Display three NFL content creators in the homepage right column',
+    acceptanceCriteria: ['Creators are visible on the homepage']
   }
 };
 
@@ -85,53 +91,68 @@ async function runQASuite() {
     silent: false
   });
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 1: Single Repository Task (PAY-101 -> repo-a)');
-  console.log('█'.repeat(75));
-  const res1 = await orchestrator.run(qaTickets.singleRepoPayment);
-  printCaseSummary(res1);
+  interface QACase {
+    name: string;
+    task: TaskInput;
+    expectStatus: OrchestratorResult['status'];
+    expectRepos?: string[]; // exact set of repos that must be touched
+  }
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 2: Single Repository Task (ORD-201 -> repo-b)');
-  console.log('█'.repeat(75));
-  const res2 = await orchestrator.run(qaTickets.singleRepoOrder);
-  printCaseSummary(res2);
+  const cases: QACase[] = [
+    { name: 'Single Repository Task (PAY-101 -> repo-a)', task: qaTickets.singleRepoPayment, expectStatus: 'COMPLETED', expectRepos: ['repo-a'] },
+    { name: 'Single Repository Task (ORD-201 -> repo-b)', task: qaTickets.singleRepoOrder, expectStatus: 'COMPLETED', expectRepos: ['repo-b'] },
+    { name: 'Single Repository Task (NOTIF-301 -> repo-c)', task: qaTickets.singleRepoNotification, expectStatus: 'COMPLETED', expectRepos: ['repo-c'] },
+    { name: 'Parallel Multi-Repo (CROSS-401 -> repo-a, repo-b, repo-c)', task: qaTickets.parallelMultiRepo, expectStatus: 'COMPLETED', expectRepos: ['repo-a', 'repo-b', 'repo-c'] },
+    { name: 'Dependent Multi-Repo (DEP-501 -> repo-b depends on repo-a)', task: qaTickets.dependentMultiRepo, expectStatus: 'COMPLETED', expectRepos: ['repo-a', 'repo-b'] },
+    { name: 'Deduplication Guard (re-submit PAY-101)', task: qaTickets.singleRepoPayment, expectStatus: 'DUPLICATE_SKIPPED' },
+    { name: 'No Matching Repo (UNR-601 -> must stop, no code written)', task: qaTickets.unroutable, expectStatus: 'NO_MATCHING_REPO', expectRepos: [] }
+  ];
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 3: Single Repository Task (NOTIF-301 -> repo-c)');
-  console.log('█'.repeat(75));
-  const res3 = await orchestrator.run(qaTickets.singleRepoNotification);
-  printCaseSummary(res3);
+  const failures: string[] = [];
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 4: Parallel Multi-Repo (CROSS-401 -> repo-a, repo-b, repo-c concurrent)');
-  console.log('█'.repeat(75));
-  const startParallel = Date.now();
-  const res4 = await orchestrator.run(qaTickets.parallelMultiRepo);
-  const parallelDuration = Date.now() - startParallel;
-  printCaseSummary(res4);
-  console.log(`[PARALLEL VERIFICATION] 3 repositories executed concurrently in ${parallelDuration}ms!`);
+  for (const [i, c] of cases.entries()) {
+    console.log('\n' + '█'.repeat(75));
+    console.log(`  TEST CASE ${i + 1}: ${c.name}`);
+    console.log('█'.repeat(75));
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 5: Dependent Multi-Repo (DEP-501 -> repo-b depends on repo-a)');
-  console.log('█'.repeat(75));
-  const res5 = await orchestrator.run(qaTickets.dependentMultiRepo);
-  printCaseSummary(res5);
-  if (res5.teamResult?.executionPlan) {
-    console.log('[DEPENDENCY VERIFICATION] Plan order:');
-    for (const p of res5.teamResult.executionPlan) {
-      console.log(`  - ${p.repoId} (depends on: ${p.dependsOn?.length ? p.dependsOn.join(', ') : 'NONE - runs first'})`);
+    const result = await orchestrator.run(c.task);
+    printCaseSummary(result);
+
+    const problems: string[] = [];
+    if (result.status !== c.expectStatus) {
+      problems.push(`expected status ${c.expectStatus}, got ${result.status}${result.error ? ` (${result.error})` : ''}`);
+    }
+    if (c.expectRepos) {
+      const touched = (result.teamResult?.repoResults ?? []).map((r) => r.repoId).sort();
+      const expected = [...c.expectRepos].sort();
+      if (touched.join(',') !== expected.join(',')) {
+        problems.push(`expected repos [${expected.join(', ')}], got [${touched.join(', ')}]`);
+      }
+    }
+    if (c.task.id === 'DEP-501' && result.teamResult) {
+      const order = result.teamResult.repoResults.map((r) => r.repoId);
+      if (order.indexOf('repo-a') > order.indexOf('repo-b')) {
+        problems.push(`dependency order violated: ${order.join(' -> ')}`);
+      }
+      console.log(`[DEPENDENCY VERIFICATION] Execution order: ${order.join(' -> ')}`);
+    }
+
+    if (problems.length === 0) {
+      console.log(`[QA] PASS`);
+    } else {
+      console.log(`[QA] FAIL: ${problems.join('; ')}`);
+      failures.push(`Case ${i + 1} (${c.task.id}): ${problems.join('; ')}`);
     }
   }
 
-  console.log('\n' + '█'.repeat(75));
-  console.log('  TEST CASE 6: Deduplication Guard (Re-submitting PAY-101 - should stop pipeline)');
-  console.log('█'.repeat(75));
-  const res6 = await orchestrator.run(qaTickets.singleRepoPayment);
-  printCaseSummary(res6);
-
   console.log('\n' + '='.repeat(75));
-  console.log('   ALL 6 QA AUTOMATION CASES COMPLETED SUCCESSFULLY!');
+  if (failures.length === 0) {
+    console.log(`   ALL ${cases.length} QA AUTOMATION CASES PASSED`);
+  } else {
+    console.log(`   ${failures.length}/${cases.length} QA CASES FAILED:`);
+    for (const f of failures) console.log(`   - ${f}`);
+    process.exitCode = 1;
+  }
   console.log('='.repeat(75));
 }
 
@@ -151,7 +172,10 @@ function printCaseSummary(result: OrchestratorResult) {
   }
 }
 
-runQASuite().catch((err) => {
-  console.error('QA Harness Error:', err);
-  process.exit(1);
-});
+// Only run when executed directly (npm run qa), never when imported (e.g. by tests).
+if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1])) {
+  runQASuite().catch((err) => {
+    console.error('QA Harness Error:', err);
+    process.exit(1);
+  });
+}

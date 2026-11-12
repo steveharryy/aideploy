@@ -24,7 +24,7 @@ Input Task (e.g. PAY-101)
     ├─── Repo Agent (repo-b)  ──► Executes in parallel (or sequential if dependent)
     │
     ▼
-[AI Provider Abstraction] ──► MockAIProvider (default offline) or ClaudeProvider
+[AI Provider Abstraction] ──► MockAIProvider (offline, deterministic)
     │
     ▼
 [Code Changes Applied]    ──► Safe file mutations scoped to repository boundaries
@@ -81,8 +81,7 @@ ai-orchestrator/
 │   │               └── agent.ts           # RepoAgentC (Notification Service)
 │   │
 │   ├── providers/
-│   │   ├── ai-provider.ts                 # AIProvider interface and MockAIProvider
-│   │   └── claude-provider.ts             # Anthropic Claude API provider
+│   │   └── ai-provider.ts                 # AIProvider interface and MockAIProvider
 │   │
 │   └── models/
 │       └── types.ts                       # Typed domain models, options, and results
@@ -119,34 +118,13 @@ ai-orchestrator/
 - **Transparent and deterministic**: Generates realistic code changes based on the task description and acceptance criteria (e.g., implementing `GET /health` with `status: 'UP'` for `PAY-101`).
 - Accurately reports its provider name as `'mock'` so audit trails reflect that mock reasoning was used.
 
-### 2. `ClaudeProvider`
-- Behind the same `AIProvider` interface:
-  ```typescript
-  export interface AIProvider {
-    readonly name: string;
-    generateChanges(options: AIProviderGenerateOptions): Promise<AIProviderResponse>;
-  }
-  ```
-- Uses native `fetch` against the Anthropic Messages API (`claude-3-5-sonnet-20241022`).
-- Asks Claude to output structured JSON matching the `FileChange[]` schema:
-  ```json
-  {
-    "reasoning": "Implemented GET /health returning status UP",
-    "fileChanges": [
-      {
-        "path": "src/server.ts",
-        "action": "modify",
-        "content": "..."
-      }
-    ]
-  }
-  ```
-- Configured via environment variables:
-  ```bash
-  AI_PROVIDER=claude
-  ANTHROPIC_API_KEY=sk-ant-api03-...
-  ANTHROPIC_MODEL=claude-3-5-sonnet-20241022
-  ```
+All providers implement the same interface, so another AI can be plugged in later without changing agent code:
+```typescript
+export interface AIProvider {
+  readonly name: string;
+  generateChanges(options: AIProviderGenerateOptions): Promise<AIProviderResponse>;
+}
+```
 
 ---
 

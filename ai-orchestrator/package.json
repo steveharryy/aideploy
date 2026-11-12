@@ -11,7 +11,8 @@
     "clean": "tsx src/clean-repos.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "watch": "tsx src/index.ts --watch"
   },
   "keywords": [
     "orchestrator",
@@ -21,13 +22,15 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "dotenv": "^16.4.7"
+    "@anthropic-ai/sdk": "^1.8.0",
+    "dotenv": "^16.4.7",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
+    "@anthropic-ai/claude-code": "^2.1.197",
     "@types/node": "^20.17.10",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
     "vitest": "^2.1.8"
   }
 }
-

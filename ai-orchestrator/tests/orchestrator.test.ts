@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Orchestrator } from '../src/orchestrator/orchestrator.js';
@@ -12,7 +13,25 @@ import { TestingAgent } from '../src/agents/testing/agent.js';
 import { RepoAgentA } from '../src/agents/team-agent/team-agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const testRepoRoot = path.resolve(__dirname, '../repositories');
+const sourceRepoRoot = path.resolve(__dirname, '../repositories');
+
+// Tests run against a throwaway copy of repositories/ so they never modify the real sample repos.
+// Agents that default to process.cwd()/repositories also resolve to this copy via chdir.
+let testRepoRoot = '';
+let tmpDir = '';
+const originalCwd = process.cwd();
+
+beforeAll(async () => {
+  tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'orchestrator-test-'));
+  testRepoRoot = path.join(tmpDir, 'repositories');
+  await fs.cp(sourceRepoRoot, testRepoRoot, { recursive: true });
+  process.chdir(tmpDir);
+});
+
+afterAll(async () => {
+  process.chdir(originalCwd);
+  await fs.rm(tmpDir, { recursive: true, force: true });
+});
 
 describe('AI Orchestrator Pipeline', () => {
   let sampleTask: TaskInput;

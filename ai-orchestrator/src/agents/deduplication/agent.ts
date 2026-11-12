@@ -16,6 +16,8 @@ export interface DeduplicationAgentConfig {
   initialTasks?: ExistingTaskRecord[];
   historyFilePath?: string;
   repositoriesRoot?: string;
+  /** Explicit repo locations (e.g. from the service catalog); overrides repositoriesRoot/<id>. */
+  repoPaths?: Record<string, string>;
 }
 
 export interface IDeduplicationAgent {
@@ -27,10 +29,12 @@ export class DeduplicationAgent implements IDeduplicationAgent {
   private existingTasks: Map<string, ExistingTaskRecord> = new Map();
   private historyFilePath?: string;
   private repositoriesRoot: string;
+  private repoPaths: Record<string, string>;
 
   constructor(config: DeduplicationAgentConfig = {}) {
     this.historyFilePath = config.historyFilePath;
     this.repositoriesRoot = config.repositoriesRoot || path.resolve(process.cwd(), 'repositories');
+    this.repoPaths = config.repoPaths || {};
 
     // 1. Load initial tasks passed in config
     if (config.initialTasks) {
@@ -90,17 +94,8 @@ export class DeduplicationAgent implements IDeduplicationAgent {
       const isCodeStillPresent = await this.verifyImplementationPresent(task, existingById);
 
       if (!isCodeStillPresent) {
-        // Code was removed or reverted! Clear record and treat as new
-        this.existingTasks.delete(task.id);
-        if (this.historyFilePath) {
-          try {
-            const list = Array.from(this.existingTasks.values());
-            await fs.writeFile(this.historyFilePath, JSON.stringify(list, null, 2), 'utf-8');
-          } catch {
-            // Ignore write errors
-          }
-        }
-
+        // Code was removed or reverted: treat as new. check() is read-only (it is also used by
+        // --plan); the record is overwritten by registerCompletedTask() if the re-run succeeds.
         return {
           taskId: task.id,
           status: 'new',
@@ -196,28 +191,28 @@ export class DeduplicationAgent implements IDeduplicationAgent {
       }
     }
 
+    const isHealthTask = taskText.includes('health') || task.id.toLowerCase().includes('pay-101');
+    let healthFound = false;
+
     for (const relFile of filesToCheck) {
-      const fullPath = path.resolve(this.repositoriesRoot, relFile);
+      // Recorded as "<repoId>/<file>"; resolve the repo via the catalog path when known.
+      const [repoId, ...rest] = relFile.split('/');
+      const fullPath = this.repoPaths[repoId]
+        ? path.resolve(this.repoPaths[repoId], rest.join('/'))
+        : path.resolve(this.repositoriesRoot, relFile);
       try {
         const content = await fs.readFile(fullPath, 'utf-8');
-
-        // Check if health endpoint was removed
-        if (taskText.includes('health') || task.id.toLowerCase().includes('pay-101')) {
-          if (!content.includes('getHealth') || !content.includes('UP')) {
-            return false;
-          }
-        } else {
-          // General check: does file still contain task id or title keyword
-          if (!content.includes(task.id) && !content.toLowerCase().includes(task.title.toLowerCase())) {
-            return false;
-          }
-        }
+        // Health tasks: at least ONE changed file must still contain the endpoint
+        // (package.json or a test file legitimately does not).
+        if (content.includes('getHealth') && content.includes('UP')) healthFound = true;
+        // General case: the file exists (read succeeded). Real code rarely contains the ticket ID
+        // or title, so their absence must not be read as "implementation removed".
       } catch {
         // File does not exist on disk
         return false;
       }
     }
 
-    return true;
+    return isHealthTask && filesToCheck.length > 0 ? healthFound : true;
   }
 }

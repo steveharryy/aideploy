@@ -34,10 +34,35 @@ export class MockAIProvider implements AIProvider {
 
     // Health endpoint mock implementation (PAY-101 / generic health check)
     if (taskText.includes('health') || taskText.includes('pay-101')) {
-      // Find server or index file in repoContext, default to src/server.ts
-      const targetFile =
-        repoContext.existingFiles.find((f) => f.path.includes('server') || f.path.includes('index'))
-          ?.path || 'src/server.ts';
+      // Only rewrite the file that actually holds PaymentServer. Overwriting another repo's
+      // entry file (e.g. repo-b's OrderService) would destroy it.
+      const paymentFile = repoContext.existingFiles.find((f) => f.content.includes('class PaymentServer'));
+
+      if (!paymentFile) {
+        return {
+          providerName: this.name,
+          reasoning: `[MockAIProvider] Task ${task.id} requested a health endpoint. Added src/health.ts in ${repoContext.repoId} without touching existing files.`,
+          fileChanges: [
+            {
+              path: 'src/health.ts',
+              action: 'create',
+              content: `// Health check - generated for ${task.id}
+export interface HealthStatus {
+  status: 'UP' | 'DOWN';
+  timestamp: string;
+}
+
+// GET /health
+export function getHealth(): HealthStatus {
+  return { status: 'UP', timestamp: new Date().toISOString() };
+}
+`
+            }
+          ]
+        };
+      }
+
+      const targetFile = paymentFile.path;
 
       const fileChanges: FileChange[] = [
         {
