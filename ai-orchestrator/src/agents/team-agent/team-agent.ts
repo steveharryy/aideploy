@@ -18,10 +18,17 @@ export interface TeamAgentConfig {
   repositoriesRoot?: string;
   repoAgentFactory?: (repoId: string, repoPath: string, aiProvider: AIProvider) => IRepoAgent;
   dependencies?: Record<string, string[]>; // e.g. { 'repo-b': ['repo-a'] }
+  /** Explicit repo locations (e.g. from the service catalog); overrides repositoriesRoot/<id>. */
+  repoPaths?: Record<string, string>;
 }
 
 export interface ITeamAgent {
-  coordinate(task: TaskInput, impact: ImpactAnalysisResult): Promise<TeamExecutionResult>;
+  /** @param workdirs optional per-run locations (e.g. a ticket's git worktree) that override configured paths. */
+  coordinate(
+    task: TaskInput,
+    impact: ImpactAnalysisResult,
+    workdirs?: Record<string, string>
+  ): Promise<TeamExecutionResult>;
 }
 
 /**
@@ -54,6 +61,7 @@ export function createDefaultRepoAgent(
  */
 export class TeamAgent implements ITeamAgent {
   private repositoriesRoot: string;
+  private repoPaths: Record<string, string>;
   private aiProvider: AIProvider;
   private repoAgentFactory: (repoId: string, repoPath: string, aiProvider: AIProvider) => IRepoAgent;
   private dependencies: Record<string, string[]>;
@@ -61,13 +69,18 @@ export class TeamAgent implements ITeamAgent {
   constructor(aiProvider: AIProvider, config: TeamAgentConfig = {}) {
     this.aiProvider = aiProvider;
     this.repositoriesRoot = config.repositoriesRoot || path.resolve(process.cwd(), 'repositories');
+    this.repoPaths = config.repoPaths || {};
     this.repoAgentFactory =
       config.repoAgentFactory ||
       ((repoId, repoPath, provider) => createDefaultRepoAgent(repoId, repoPath, provider));
     this.dependencies = config.dependencies || {};
   }
 
-  async coordinate(task: TaskInput, impact: ImpactAnalysisResult): Promise<TeamExecutionResult> {
+  async coordinate(
+    task: TaskInput,
+    impact: ImpactAnalysisResult,
+    workdirs: Record<string, string> = {}
+  ): Promise<TeamExecutionResult> {
     const reposToProcess = impact.affectedRepositories;
 
     if (!reposToProcess || reposToProcess.length === 0) {
@@ -85,67 +98,64 @@ export class TeamAgent implements ITeamAgent {
       dependsOn: this.dependencies[repoId]?.filter((dep) => reposToProcess.includes(dep)) || []
     }));
 
-    // Partition into independent repos (no dependencies in this set) and dependent repos
-    const independentRepos = executionPlan.filter((p) => !p.dependsOn || p.dependsOn.length === 0);
-    const dependentRepos = executionPlan.filter((p) => p.dependsOn && p.dependsOn.length > 0);
-
     const repoResults: RepoExecutionResult[] = [];
+    const succeeded = new Set<string>();
+    const failed = new Set<string>();
+    let pending = [...executionPlan];
 
-    // Step 1: Execute independent repositories in parallel using Promise.all
-    if (independentRepos.length > 0) {
-      const independentPromises = independentRepos.map((planItem) => {
-        const repoPath = path.resolve(this.repositoriesRoot, planItem.repoId);
-        const agent = this.repoAgentFactory(planItem.repoId, repoPath, this.aiProvider);
-        return agent.execute(task);
+    const skip = (planItem: TeamExecutionPlan, reasoning: string, error: string) => {
+      failed.add(planItem.repoId);
+      repoResults.push({
+        repoId: planItem.repoId,
+        success: false,
+        changedFiles: [],
+        providerUsed: this.aiProvider.name,
+        reasoning,
+        message: `Skipping ${planItem.repoId}: ${error}`,
+        error
       });
+    };
 
-      const independentResults = await Promise.all(independentPromises);
-      repoResults.push(...independentResults);
-    }
-
-
-    const hasFailures = repoResults.some((r) => !r.success);
-
-    if (hasFailures && dependentRepos.length > 0) {
-      for (const planItem of dependentRepos) {
-        repoResults.push({
-          repoId: planItem.repoId,
-          success: false,
-          changedFiles: [],
-          providerUsed: this.aiProvider.name,
-          reasoning: 'Skipped due to upstream repository failure.',
-          message: `Skipping ${planItem.repoId} because upstream dependencies failed.`,
-          error: 'Upstream dependency failure'
-        });
-      }
-    }
-
-    // Step 3: Execute dependent repositories sequentially
-    if (!hasFailures && dependentRepos.length > 0) {
-      for (const planItem of dependentRepos) {
-        // Verify dependencies succeeded
-        const depsMet = (planItem.dependsOn || []).every((dep) =>
-          repoResults.some((r) => r.repoId === dep && r.success)
-        );
-
-        if (!depsMet) {
-          repoResults.push({
-            repoId: planItem.repoId,
-            success: false,
-            changedFiles: [],
-            providerUsed: this.aiProvider.name,
-            reasoning: 'Dependency check failed.',
-            message: `Skipping ${planItem.repoId} because required dependencies failed or were not met.`,
-            error: `Unmet dependencies: ${(planItem.dependsOn || []).join(', ')}`
-          });
-          continue;
+    // Dependency-ordered waves: each wave runs (in parallel) every repo whose
+    // dependencies have all succeeded. Works for chains (a <- b <- c) in any input order.
+    while (pending.length > 0) {
+      // Repos with a failed/skipped dependency are skipped. Repeat until stable so the
+      // skip propagates transitively (a fails -> b skipped -> c skipped) in one pass.
+      let blocked = pending.filter((p) => (p.dependsOn || []).some((d) => failed.has(d)));
+      while (blocked.length > 0) {
+        for (const planItem of blocked) {
+          const failedDeps = (planItem.dependsOn || []).filter((d) => failed.has(d));
+          skip(planItem, 'Skipped due to upstream repository failure.', `Upstream dependency failure: ${failedDeps.join(', ')}`);
         }
-
-        const repoPath = path.resolve(this.repositoriesRoot, planItem.repoId);
-        const agent = this.repoAgentFactory(planItem.repoId, repoPath, this.aiProvider);
-        const result = await agent.execute(task);
-        repoResults.push(result);
+        pending = pending.filter((p) => !blocked.includes(p));
+        blocked = pending.filter((p) => (p.dependsOn || []).some((d) => failed.has(d)));
       }
+
+      const ready = pending.filter((p) => (p.dependsOn || []).every((d) => succeeded.has(d)));
+      if (ready.length === 0) {
+        // Nothing runnable and nothing failed upstream => dependency cycle.
+        for (const planItem of pending) {
+          skip(planItem, 'Dependency cycle detected.', `Circular dependency involving: ${pending.map((p) => p.repoId).join(', ')}`);
+        }
+        break;
+      }
+
+      const waveResults = await Promise.all(
+        ready.map((planItem) => {
+          const repoPath =
+            workdirs[planItem.repoId] ||
+            this.repoPaths[planItem.repoId] ||
+            path.resolve(this.repositoriesRoot, planItem.repoId);
+          const agent = this.repoAgentFactory(planItem.repoId, repoPath, this.aiProvider);
+          return agent.execute(task);
+        })
+      );
+
+      for (const result of waveResults) {
+        repoResults.push(result);
+        (result.success ? succeeded : failed).add(result.repoId);
+      }
+      pending = pending.filter((p) => !ready.includes(p));
     }
 
     const overallSuccess = repoResults.length > 0 && repoResults.every((r) => r.success);

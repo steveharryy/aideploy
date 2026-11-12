@@ -8,6 +8,7 @@ import type {
   RepoFileSnapshot,
   TaskInput
 } from '../../../models/types.js';
+import { checkTestIntegrity } from './test-integrity.js';
 
 export interface IRepoAgent {
   readonly repoId: string;
@@ -101,7 +102,11 @@ export abstract class BaseRepoAgent implements IRepoAgent {
     const entries = await fs.readdir(dir, { withFileTypes: true });
 
     for (const entry of entries) {
-      if (['node_modules', '.git', 'dist'].includes(entry.name)) {
+      if (
+        ['node_modules', '.git', 'dist', 'coverage', 'package-lock.json', 'yarn.lock', 'pnpm-lock.yaml'].includes(
+          entry.name
+        )
+      ) {
         continue;
       }
 
@@ -112,7 +117,7 @@ export abstract class BaseRepoAgent implements IRepoAgent {
         const nested = await this.collectRelevantFiles(fullPath, relativePath);
         snapshots.push(...nested);
       } else if (entry.isFile()) {
-        if (/\.(ts|js|json|md|txt)$/.test(entry.name)) {
+        if (/\.(ts|tsx|js|jsx|mjs|cjs|json|md|txt|css|scss|html|ya?ml|py)$/.test(entry.name)) {
           const content = await fs.readFile(fullPath, 'utf-8');
           snapshots.push({
             path: relativePath,
@@ -126,15 +131,39 @@ export abstract class BaseRepoAgent implements IRepoAgent {
   }
 
   private async applyFileChanges(changes: FileChange[]): Promise<string[]> {
-    const modified: string[] = [];
+    const repoRoot = path.resolve(this.repoPath);
 
-    for (const change of changes) {
-      const targetPath = path.resolve(this.repoPath, change.path);
-
-      if (!targetPath.startsWith(path.resolve(this.repoPath))) {
+    // Validate every path BEFORE writing anything, so one bad path can't leave a half-applied change set.
+    const resolved = changes.map((change) => {
+      const targetPath = path.resolve(repoRoot, change.path);
+      const relative = path.relative(repoRoot, targetPath);
+      // path.relative catches sibling-prefix escapes (repo-a -> repo-a-evil) that startsWith() missed.
+      if (
+        !relative ||
+        relative === '..' ||
+        relative.startsWith('..' + path.sep) ||
+        path.isAbsolute(relative) ||
+        relative.split(path.sep)[0] === '.git'
+      ) {
         throw new Error(`Security violation: File path escapes repository boundary: ${change.path}`);
       }
+      return { change, targetPath };
+    });
 
+    // Test integrity (design rule 7): never delete, skip or weaken existing tests.
+    const violations = await checkTestIntegrity(changes, async (relPath) => {
+      try {
+        return await fs.readFile(path.resolve(repoRoot, relPath), 'utf-8');
+      } catch {
+        return undefined;
+      }
+    });
+    if (violations.length > 0) {
+      throw new Error(`Test integrity violation: ${violations.join('; ')}`);
+    }
+
+    const modified: string[] = [];
+    for (const { change, targetPath } of resolved) {
       if (change.action === 'delete') {
         try {
           await fs.unlink(targetPath);

@@ -78,21 +78,68 @@ export class NotificationService {
   await fs.writeFile(repoCIndex, repoCBaseline, 'utf-8');
   console.log('✓ Reset: repo-c/src/index.ts');
 
+  const descriptions: Record<string, string> = {
+    'repo-a': 'Payment Service Repository',
+    'repo-b': 'Order Service Repository',
+    'repo-c': 'Notification Service Repository'
+  };
   for (const repo of ['repo-a', 'repo-b', 'repo-c']) {
-    const featuresDir = path.join(repoRoot, repo, 'src', 'features');
+    const repoDir = path.join(repoRoot, repo);
+
+    const featuresDir = path.join(repoDir, 'src', 'features');
     if (fsSync.existsSync(featuresDir)) {
       await fs.rm(featuresDir, { recursive: true, force: true });
       console.log(`✓ Cleaned: ${repo}/src/features/ folder removed`);
     }
+
+    // Anything an AI agent added: extra source/test files, dependencies, installed packages.
+    for (const extra of ['src/health.ts', 'node_modules', 'package-lock.json', 'tsconfig.json']) {
+      const target = path.join(repoDir, extra);
+      if (fsSync.existsSync(target)) {
+        await fs.rm(target, { recursive: true, force: true });
+        console.log(`✓ Cleaned: ${repo}/${extra}`);
+      }
+    }
+    const testsDir = path.join(repoDir, 'tests');
+    for (const file of fsSync.existsSync(testsDir) ? await fs.readdir(testsDir) : []) {
+      if (file !== 'test.js') {
+        await fs.rm(path.join(testsDir, file), { recursive: true, force: true });
+        console.log(`✓ Cleaned: ${repo}/tests/${file}`);
+      }
+    }
+    const baselinePkg = {
+      name: repo,
+      version: '1.0.0',
+      description: descriptions[repo],
+      type: 'module',
+      scripts: { test: 'node tests/test.js' }
+    };
+    await fs.writeFile(path.join(repoDir, 'package.json'), JSON.stringify(baselinePkg, null, 2) + '\n\n', 'utf-8');
   }
 
+  // Forget only the SAMPLE tickets; real tickets (e.g. T2-546) keep their history and job records.
+  const sampleIds = new Set(['PAY-101', 'ORD-201', 'NOTIF-301', 'CROSS-401', 'DEP-501', 'UNR-601', 'MULTI-101']);
   if (fsSync.existsSync(historyFile)) {
-    await fs.unlink(historyFile);
-    console.log('✓ Deleted: .task-history.json (Deduplication memory cleared)');
+    try {
+      const history = JSON.parse(await fs.readFile(historyFile, 'utf-8')) as Array<{ id: string }>;
+      const kept = history.filter((t) => !sampleIds.has(t.id));
+      await fs.writeFile(historyFile, JSON.stringify(kept, null, 2), 'utf-8');
+      console.log(`✓ History: removed ${history.length - kept.length} sample ticket(s), kept ${kept.length} real ticket(s)`);
+    } catch {
+      console.log('! History file unreadable; left untouched');
+    }
+  }
+  const jobsDir = path.resolve(process.cwd(), process.env.JOBS_DIR || '.jobs');
+  for (const id of sampleIds) {
+    const dir = path.join(jobsDir, id);
+    if (fsSync.existsSync(dir)) {
+      await fs.rm(dir, { recursive: true, force: true });
+      console.log(`✓ Removed job record: .jobs/${id}`);
+    }
   }
 
   console.log('='.repeat(65));
-  console.log('   CLEANUP COMPLETE: All repositories restored to original baseline.');
+  console.log('   CLEANUP COMPLETE: sample repos restored; history of real tickets kept.');
   console.log('='.repeat(65));
 }
 

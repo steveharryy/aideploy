@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "npm --prefix ai-orchestrator start",
+    "start": "npm --prefix ai-orchestrator start --",
     "qa": "npm --prefix ai-orchestrator run qa",
     "clean": "npm --prefix ai-orchestrator run clean",
     "test": "npm --prefix ai-orchestrator test",

@@ -5,3 +5,13 @@ dist/
 coverage/
 .DS_Store
 .task-history.json
+.jobs/
+.worktrees/
+.handoff/
+
+# Real company repos placed under repositories/ for the orchestrator to work on:
+# never commit them to this project. Only the three sample repos are tracked.
+ai-orchestrator/repositories/*
+!ai-orchestrator/repositories/repo-a/
+!ai-orchestrator/repositories/repo-b/
+!ai-orchestrator/repositories/repo-c/

@@ -111,11 +111,23 @@ export interface TestingResult {
 
 export type OrchestrationStatus =
   | 'COMPLETED'
+  | 'LOCKED'
   | 'DUPLICATE_SKIPPED'
   | 'IMPACT_FAILED'
+  | 'NO_MATCHING_REPO'
+  | 'PLAN_REJECTED'
   | 'DEDUPLICATION_FAILED'
   | 'EXECUTION_FAILED'
   | 'TEST_FAILED';
+
+/** Where and on which branch a repo's changes for this ticket live. */
+export interface RepoBranchResult {
+  repoId: string;
+  workdir: string;
+  managedByGit: boolean;
+  branch?: string;
+  commit?: string;
+}
 
 export interface OrchestratorResult {
   taskId: string;
@@ -125,6 +137,10 @@ export interface OrchestratorResult {
   deduplication?: DeduplicationResult;
   teamResult?: TeamExecutionResult;
   testingResult?: TestingResult;
+  /** Per-repo branch/worktree/commit (only when a workspace manager is configured). */
+  branches?: RepoBranchResult[];
+  /** Path of the persisted job state (only when a job store is configured). */
+  jobFile?: string;
   error?: string;
   durationMs: number;
 }
