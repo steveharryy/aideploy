@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { safeErrorMessage } from '../../util/redact.js';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
@@ -22,7 +23,8 @@ export interface PullRequestResult {
   existing: boolean;
 }
 
-export type GitRunner = (cwd: string, args: string[]) => Promise<string>;
+/** Runs git. env adds variables for this call only (used to pass credentials outside argv). */
+export type GitRunner = (cwd: string, args: string[], env?: Record<string, string>) => Promise<string>;
 
 export interface BitbucketClientConfig {
   /** Repository/workspace access token (Bearer). Preferred for automation. */
@@ -35,9 +37,14 @@ export interface BitbucketClientConfig {
   git?: GitRunner;
 }
 
-const defaultGit: GitRunner = async (cwd, args) => {
-  const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 10 * 1024 * 1024 });
-  return stdout.trim();
+const defaultGit: GitRunner = async (cwd, args, env) => {
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 10 * 1024 * 1024, ...(env ? { env: { ...process.env, ...env } } : {}) });
+    return stdout.trim();
+  } catch (err) {
+    // execFile errors repeat the command line and git's output: never let a secret through.
+    throw new Error(safeErrorMessage(err));
+  }
 };
 
 /**
@@ -88,8 +95,13 @@ export class BitbucketClient {
     BitbucketClient.assertPushableBranch(branch);
     if (this.configured) {
       const url = `https://bitbucket.org/${ref.workspace}/${ref.repo}.git`;
-      // Credentials go in a one-off header, never into the remote URL or logs.
-      await this.git(workdir, ['-c', `http.extraHeader=Authorization: ${this.authHeader()}`, 'push', url, `${branch}:${branch}`]);
+      // Credentials go in a one-off header passed through the ENVIRONMENT (git's GIT_CONFIG_* variables),
+      // never on the command line, which error messages and process lists would show.
+      await this.git(workdir, ['push', url, `${branch}:${branch}`], {
+        GIT_CONFIG_COUNT: '1',
+        GIT_CONFIG_KEY_0: 'http.extraHeader',
+        GIT_CONFIG_VALUE_0: `Authorization: ${this.authHeader()}`
+      });
     } else {
       await this.git(workdir, ['push', 'origin', `${branch}:${branch}`]);
     }

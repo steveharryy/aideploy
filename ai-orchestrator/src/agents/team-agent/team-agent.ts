@@ -93,9 +93,13 @@ export class TeamAgent implements ITeamAgent {
     }
 
 
+    // Order comes from the catalog plus the approved plan's work-item dependencies.
+    const planDeps = (task.metadata?.approvedRepoDependencies as Record<string, string[]> | undefined) || {};
     const executionPlan: TeamExecutionPlan[] = reposToProcess.map((repoId) => ({
       repoId,
-      dependsOn: this.dependencies[repoId]?.filter((dep) => reposToProcess.includes(dep)) || []
+      dependsOn: [...new Set([...(this.dependencies[repoId] || []), ...(planDeps[repoId] || [])])].filter(
+        (dep) => dep !== repoId && reposToProcess.includes(dep)
+      )
     }));
 
     const repoResults: RepoExecutionResult[] = [];

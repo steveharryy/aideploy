@@ -1,310 +1,267 @@
 # AI Development Orchestrator
 
-A modular, test-driven local AI development orchestrator built with Node.js and TypeScript. It coordinates a pipeline of specialized agents to analyze, deduplicate, plan, implement, and deterministically test software engineering tasks across multiple repositories.
+Turns a Jira ticket into a reviewed plan and, after a person approves it, into tested code on its own branch.
+
+A person adds the label `ai-ready` to a Jira ticket. The pipeline checks the ticket, a planning agent reads the real code and writes a plan, and people answer its questions and approve the plan **in Jira comments**. Only after approval does a coding agent write tests and code on a branch `ai/<ticket>`. The pipeline re-runs the checks itself and opens a pull request. **Nothing is merged or deployed automatically.**
+
+Built with Node.js 24 and TypeScript. The AI agents run on Claude Code.
 
 ---
 
-## Architecture Overview
+## Contents
 
-The system decouples high-level coordination from low-level repository modifications and coding models. The overall workflow follows a single-direction pipeline with early exit guards:
+1. [How it works](#how-it-works)
+2. [Setup](#setup)
+3. [Running it](#running-it)
+4. [Using it from Jira](#using-it-from-jira)
+5. [Configuration](#configuration)
+6. [Guardrails](#guardrails)
+7. [Where state is kept](#where-state-is-kept)
+8. [Operations](#operations)
+9. [Development](#development)
+10. [Not built yet](#not-built-yet)
+
+---
+
+## How it works
 
 ```text
-Input Task (Jira ticket via API, or demo task e.g. PAY-101)
-    │
-    ▼
-[Deduplication Agent]     ──► Halts pipeline early if task is duplicate/already implemented
-    │
-    ▼
-[Impact Analysis Agent]   ──► Scopes affected repositories (whole-word rules + Jira labels/components)
-    │                         No match ──► stops with NO_MATCHING_REPO (no code written)
-    │
-    ▼
-[Team Agent]              ──► Analyzes dependencies and coordinates Repo Agent(s)
-    │
-    ├─── Repo Agent (repo-a)  ──► Inspects repo, builds context, invokes AI
-    ├─── Repo Agent (repo-b)  ──► Executes in parallel (or sequential if dependent)
-    │
-    ▼
-[AI Provider Abstraction] ──► MockAIProvider (offline, deterministic)
-    │
-    ▼
-[Code Changes Applied]    ──► Safe file mutations scoped to repository boundaries
-    │
-    ▼
-[Testing Agent]           ──► Runs deterministic tests (npm test / test suites)
-    │
-    ▼
-[Structured Result]       ──► OrchestratorResult with status, diffs, and audit logs
+Jira ticket + label ai-ready
+   │
+   ▼
+Trigger ─── poller (every 2 min) or Jira webhook; one ticket at a time
+   │
+   ▼
+Guards ──── kill switch · duplicate check · one run per ticket
+   │
+   ▼
+Context ─── ticket, comments, parent, links, Confluence pages, similar tickets
+   │
+   ▼
+Intake ──── plain code, no AI cost: description, issue type, size (+ product/component per project)
+   │           fails → comment "what is missing", ticket assigned back to the reporter
+   ▼
+Planning agent ─── Claude Code with all built-in tools OFF, only 5 guarded tools:
+   │                 jira_read · list_repos · search_code · read_file · submit_plan
+   │                 reads the real repos (pipeline-owned clones on main)
+   ▼
+Decision (code, not the AI)
+   ├─ expected behaviour or product/repo missing  → comment: what is missing   (needs_info)
+   ├─ blocking gap or unclear edge case          → comment: questions A/B/C    (needs_input)
+   ├─ invalid plan or error                      → comment: why                (needs_human)
+   └─ all clear                                  → comment: formatted plan     (plan_review)
+   │
+   ▼
+People in Jira ── answer in a comment + re-add ai-ready (loops back to Context)
+   │               request changes: comment + ai-ready → plan v2, v3…
+   │               approve: add label ai-approved
+   ▼
+Coding (after approval only) ── per repo, in plan order, on branch ai/<ticket> from main
+   │   Claude Code in a sandbox copy: tests first (must fail) → code → verify
+   │   pipeline checks: files stay in the repo, no test deleted/skipped; re-runs verify itself
+   ▼
+Commit on ai/<ticket> → push + Bitbucket PR (when configured) → PR link on Jira → a person merges
 ```
 
----
+### The planning decision
 
-## Agent Pipeline Responsibilities
+The planning agent fills a 7-item readiness checklist (expected behaviour, current behaviour, product and repo, example, edge cases, scope, verification), recording each as found, missing or ambiguous and where it found it. It rates every gap: *if I guess wrong, does it change what users see, money or data?* No means **minor** (it states an assumption). Yes means **blocking** (it writes a question with options and a default). It also sweeps edge cases from the code, existing tests, past tickets, the business domain and generic cases (boundaries, nulls, concurrency, money rounding).
 
-| Agent / Component | Responsibility |
-| :--- | :--- |
-| **Orchestrator** | Owns and controls the execution lifecycle. Dispatches tasks across agents, passes typed contexts, enforces error boundaries, and produces the final execution summary. |
-| **Impact Analysis Agent** | Analyzes task specifications and acceptance criteria to identify impacted repositories, modules, and target files with confidence scores and reasoning. |
-| **Deduplication Agent** | Guards the pipeline against redundant work. Checks task history (`.task-history.json`) and verifies code presence on disk (allows re-running if code was deleted). |
-| **Team Agent** | Coordinates multi-repo execution. Generates an execution plan, runs independent repositories in parallel via `Promise.all`, and executes dependent repositories sequentially. |
-| **Repo Agent** | Strictly bound to a single repository (`repoId`, `repoPath`). Snapshots source files, invokes the AI provider, and writes file changes with path traversal protection. |
-| **AI Provider Abstraction** | Decouples the reasoning engine from orchestration logic. Currently uses the offline mock; a real LLM can be added later behind the same interface without changing agent code. |
-| **Testing Agent** | Executes deterministic tests (e.g., repository `npm test` suites, contract tests) post-modification. Never relies on LLM claims that code works. |
-
----
-
-## Project Structure
+Code then decides, using the same rule every time:
 
 ```text
-Orchestrator/
-├── package.json                           # Root package proxying commands to ai-orchestrator
-├── .gitignore                             # Ignores node_modules, .env, .task-history.json
-├── README.md                              # Main documentation and run guide
-│
-└── ai-orchestrator/
-    ├── src/
-    │   ├── index.ts                       # Entry point and CLI runner (npm start)
-    │   ├── qa-runner.ts                   # Automated QA test suite runner (npm run qa)
-    │   ├── clean-repos.ts                 # Baseline reset script (npm run clean)
-    │   │
-    │   ├── orchestrator/
-    │   │   └── orchestrator.ts            # Main workflow coordinator
-    │   │
-    │   ├── agents/
-    │   │   ├── impact-analysis/agent.ts   # Scopes task impact across repositories
-    │   │   ├── deduplication/agent.ts     # Task duplication & codebase verification
-    │   │   ├── testing/agent.ts           # Deterministic test runner
-    │   │   └── team-agent/
-    │   │       ├── team-agent.ts          # Multi-repo coordinator (parallel/sequential)
-    │   │       └── repo-agents/
-    │   │           ├── base-repo-agent.ts # Base class for repository agents
-    │   │           ├── repo-agent-a/      # Payment Service agent
-    │   │           ├── repo-agent-b/      # Order Service agent
-    │   │           └── repo-agent-c/      # Notification Service agent
-    │   │
-    │   ├── providers/
-    │   │   └── ai-provider.ts             # AIProvider interface and MockAIProvider
-    │   │
-    │   └── models/
-    │       └── types.ts                   # Domain models and TypeScript interfaces
-    │
-    ├── repositories/
-    │   ├── repo-a/                        # Payment Service sample repo (with test suite)
-    │   ├── repo-b/                        # Order Service sample repo (with test suite)
-    │   └── repo-c/                        # Notification Service sample repo (with test suite)
-    │
-    ├── tests/
-    │   └── orchestrator.test.ts           # 12 pipeline tests (+ regressions.test.ts, jira.test.ts)
-    │
-    ├── package.json
-    ├── tsconfig.json
-    └── .env.example                       # Environment configuration template
+expected behaviour OR product/repo not found   → TOO VAGUE  (back to the reporter)
+any blocking gap OR any unclear edge case      → QUESTIONS  (asked in a Jira comment)
+otherwise                                       → READY      (plan posted; minor gaps listed as assumptions)
 ```
+
+Before posting, code also validates the plan: every checklist item present, repos in the catalog and cloned, every acceptance criterion and test linked to a work item, no dependency cycles, and a shared contract when more than one repo changes. It raises risk for money topics, merges duplicate questions, turns a low-confidence repo choice into a question, and adds a warning when the chosen repo differs from the component map.
 
 ---
 
-## Quick Start & Commands Guide
+## Setup
 
-You can run all commands directly from the **root directory** (commands are automatically proxied to `ai-orchestrator`):
-
-### 1. `npm start` — CLI Demonstration
-Runs the two core demonstration scenarios specified in the requirements:
-* **Scenario 1 (New Feature Task):** Takes ticket `PAY-101` (*"Add GET /health endpoint to the payment service"*), executes through the full pipeline, modifies `repo-a/src/server.ts`, runs repository tests, and marks the task completed.
-* **Scenario 2 (Duplicate Task Guard):** Submits the identical `PAY-101` task again. The Deduplication Agent detects the duplicate, halts the pipeline early, and returns `DUPLICATE_SKIPPED` without wasting compute or AI tokens.
+Requirements: Node.js 22.12+ (24 recommended), git, access to the Bitbucket repos over SSH, a Jira Cloud account, and a Claude account logged in to Claude Code on the machine (`npx claude` once to log in).
 
 ```bash
-npm start
+cd ai-orchestrator
+npm ci
+cp .env.example .env        # fill in JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN (use a bot account)
 ```
 
----
-
-### 2. `npm run qa` — Automated QA Test Suite
-Executes an automated end-to-end QA harness across **7 scenarios**, asserting the expected status and exact repos for each (exits 1 on any failure):
-1. **Single Repo Task (`PAY-101`)**: Updates Payment Service (`repo-a`).
-2. **Single Repo Task (`ORD-201`)**: Updates Order Service (`repo-b`).
-3. **Single Repo Task (`NOTIF-301`)**: Updates Notification Service (`repo-c`).
-4. **Parallel Multi-Repo (`CROSS-401`)**: Executes changes in `repo-a`, `repo-b`, and `repo-c` concurrently via `Promise.all`.
-5. **Dependent Sequential Multi-Repo (`DEP-501`)**: Enforces dependency ordering where `repo-b` waits for `repo-a` before running.
-6. **Deduplication Guard**: Verifies that re-submitting a completed ticket stops execution.
-7. **No Matching Repo (`UNR-601`)**: An unroutable ticket stops with `NO_MATCHING_REPO` and no code is written.
+Clone the repos the pipeline may work on into `ai-orchestrator/.repos/` (gitignored), on their base branch. These are the pipeline's own clones; developers' working copies are never used.
 
 ```bash
-npm run qa
+mkdir -p .repos && cd .repos
+git clone --branch main git@ssh.bitbucket.org:rosstech/gb-event-api-service.git
+# … one per repo listed in catalog/repos.yaml
+git -C gb-event-api-service pull --ff-only   # refresh before planning
 ```
 
----
-
-### 3. `npm run clean` — Revoke All Changes & Reset to Baseline
-Restores all 3 repositories back to their clean initial state and deletes `.task-history.json`. Use this anytime you want to clear out generated code and restart fresh:
+Then check:
 
 ```bash
-npm run clean
+npm run typecheck && npm test          # 205 tests, no network
+npm start -- --plan T2-123             # plan one ticket: read-only, no Jira writes
 ```
 
 ---
 
-### 4. `npm test` — Run Automated Pipeline Tests
-Runs **83 Vitest tests** (against a temporary copy of `repositories/`, so the sample repos are never modified). The 12 core pipeline tests cover every agent boundary, concurrency constraint, and error condition:
-* Complete end-to-end new task pipeline execution.
-* Deduplication early-exit stopping behavior.
-* Re-run allowance when code is deleted from disk.
-* AI provider failure handling.
-* Repository path not found handling.
-* Deterministic test failure handling.
-* Parallel execution verification for independent repositories.
-* Sequential dependency order execution.
-* TeamAgent coordinate exception resilience.
-* TestingAgent spawn failure resilience.
-* Dependent repository skipped status tracking when upstream fails.
-* Multi-repo agent instantiation across `repo-a`, `repo-b`, and `repo-c`.
+## Running it
 
-Plus:
-* 4 offline unit tests for the Jira client (`tests/jira.test.ts`, Jira API faked — no token needed).
-* 16 pilot-foundation tests (`tests/pilot.test.ts`): catalog, ticket lock, test-integrity guard, verify contract, and a real git repo end-to-end (branch, worktree, commit, main checkout untouched).
-* 14 regression tests (`tests/regressions.test.ts`): whole-word routing, no repo-a fallback, dedup-before-impact, dependency chains/cycles, path-escape blocking, non-destructive mock.
-
-```bash
-npm test
-```
-
----
-
-### 5. `npm run typecheck` — TypeScript Compiler Check
-Verifies complete type safety across the codebase using `tsc --noEmit`:
-
-```bash
-npm run typecheck
-```
-
----
-
-## AI Provider Configuration
-
-The orchestrator supports pluggable AI providers via the `AIProvider` interface:
-
-### 1. `MockAIProvider` (Default)
-* **Zero API keys required**: Runs 100% offline.
-* **Deterministic & fast (< 1ms)**: Automatically generates code for `PAY-101` (health endpoint) and feature tickets.
-* Configured by default in `.env`:
-  ```env
-  AI_PROVIDER=mock
-  ```
-
-Any other AI can be added later by implementing the same `AIProvider` interface (`name` + `generateChanges()`); no agent code needs to change.
-
----
-
-## Pipeline Foundations (catalog, job lock, branches, verify, test integrity)
-
-These follow the "Jira → Verified Dev Deploy" design and are all **opt-in or backward compatible** — the sample repos behave exactly as before.
-
-| Feature | Where | What it does |
-| :--- | :--- | :--- |
-| **Service catalog** | `ai-orchestrator/catalog/repos.yaml` | One file lists every repo: path, routing keywords, `dependsOn` (deploy order), `verify` commands, owner, dev URL, Jenkins job. Adding a repo needs no code change. If the file is missing, built-in defaults are used. |
-| **Job state + ticket lock** | `.jobs/<TICKET>/job.json` + `lock` | Only one run per ticket at a time (a second run returns `LOCKED`). Every stage, branch, commit and error is recorded; earlier runs are kept in `history`. Stale locks from crashed runs are taken over automatically. |
-| **Branch + worktree per ticket** | `.worktrees/<TICKET>/<repo>` | For a repo that is its own git repository, work happens on branch `ai/<ticket>` in a separate worktree — **your own checkout is never touched**. On success the changes are committed there (never pushed). On failure nothing is committed and the worktree is kept for inspection. Non-git folders (like the samples) are worked on in place. |
-| **Verify contract** | `verify:` in `repos.yaml` | The Testing Agent runs the repo's verify commands in order (stops at the first failure). Fallbacks: `make verify` if the Makefile has it, then `npm test`. |
-| **Test-integrity guard** | Repo Agent, before writing | Blocks any change that deletes a test file, removes/comments out test cases, or adds `.skip` / `.only` / `xit` / `@Disabled` / pytest skip markers. Nothing is written if it trips. |
-| **Jira comments** | Jira client | Comments are fetched (read-only) and shown in `--dry-run`. |
-
-```bash
-npm start -- --status RT-123    # stages, branch, commit, earlier attempts
-npm start -- --unlock RT-123    # remove a stuck lock (refuses if the run is still alive)
-```
-
-Cleanup after trying a ticket on a real repo: `git worktree remove .worktrees/<TICKET>/<repo>` and `git branch -D ai/<ticket>` (run inside that repo).
-
----
-
-## Full Automation: Jira ticket → plan → approval → code → tests → PR
-
-`npm run watch` polls Jira (default every 2 min) and drives labelled tickets end to end. **Labels are the only trigger.**
-
-```
-You add label  ai-ready
-   → watcher: duplicate check → impact analysis → Claude Code drafts a change plan (read-only)
-   → Jira comment with the plan + label ai-plan-pending          (nothing changed yet)
-Tech lead adds label  ai-approved
-   → Claude Code: tests first → code → verify; pipeline re-verifies (install / typecheck / test)
-   → commit on ai/<ticket> → push → Bitbucket PR → Jira comment with PR link + label ai-pr-raised
-Any failure → Jira comment with the reason + label ai-needs-human
-```
+All commands work from the repo root or from `ai-orchestrator/`.
 
 | Command | What it does |
-| :--- | :--- |
-| `npm run watch` | Poll continuously (Ctrl+C stops after the current cycle) |
-| `npm run watch -- --once` | One cycle and exit (for Jenkins/cron) |
-| `npm run watch -- --dry-run` | Show what it would do: no Jira writes, no AI runs |
+|---|---|
+| `npm run watch` | Poll Jira every 2 minutes and handle labelled tickets end to end |
+| `npm run watch -- --once` | One polling cycle, then exit (for cron/Jenkins) |
+| `npm run watch -- --dry-run` | Show what would happen: no Jira writes, no AI runs |
+| `npm run webhook` | Receive Jira webhooks on `POST /webhooks/jira` (health: `GET /healthz`), with a JQL safety-net poll every 15 minutes |
+| `npm start -- --plan T2-123` | Plan one ticket in the terminal. Read-only, nothing posted |
+| `npm start -- T2-123` | Plan, approve in the terminal, then code (manual run) |
+| `npm start -- --sessions` | Every ticket and its current phase |
+| `npm start -- --status T2-123` | One ticket's phase history and job details |
+| `npm start -- --unlock T2-123` | Remove a stuck lock (refused while a run is alive) |
+| `npm start -- --demo --provider mock` | Offline demo on the sample repos |
 
-Guardrails: only labelled tickets; one watcher at a time; per-ticket lock; max 3 attempts; only `ai/*` branches are pushed; **nothing is merged or deployed automatically**. PRs need the repo to be a real git clone with `bitbucket` + `baseBranch` in `catalog/repos.yaml` and `BITBUCKET_TOKEN` set; otherwise the ticket is labelled `ai-done` and the comment says why no PR was opened. Settings: see `.env.example`.
+Only one watcher or webhook server runs at a time (lock file in `.jobs/`).
 
----
+### Webhook setup in Jira
 
-## Jira Integration
+Jira needs a public HTTPS URL for the server (for testing: `cloudflared tunnel --url http://localhost:8080`). Then either:
 
-Tickets can be pulled straight from Jira Cloud instead of the hard-coded demo task.
+- **Jira Automation** (project admin): trigger *Field value changed: Labels*, condition JQL `labels in (ai-ready, ai-approved)`, action *Send web request* to `https://<host>/webhooks/jira`, header `X-Webhook-Secret: <JIRA_WEBHOOK_SECRET>`, body `{"issueKey": "{{issue.key}}"}`.
+- **System webhook** (Jira admin): URL as above, *Secret* = `JIRA_WEBHOOK_SECRET`, event *Issue updated*, JQL filter on the labels.
 
-**Setup** (in `ai-orchestrator/.env`):
-```env
-JIRA_BASE_URL=https://your-site.atlassian.net
-JIRA_EMAIL=you@example.com
-JIRA_API_TOKEN=...          # https://id.atlassian.com/manage-profile/security/api-tokens
-# optional: custom field that stores acceptance criteria
-JIRA_ACCEPTANCE_CRITERIA_FIELD=customfield_10042
-```
-
-**Usage** (from the repo root or `ai-orchestrator/`):
-```bash
-npm start -- --dry-run RT-123                 # fetch + show the parsed task, change nothing
-npm start -- RT-123                           # run one ticket through the pipeline
-npm start -- RT-123 RT-124                    # several tickets
-npm start -- --jql "project = RT AND status = 'Ready for Dev'" --max 3
-```
-
-**How tickets map to tasks**
-| Jira field | TaskInput |
-| :--- | :--- |
-| Issue key | `id` |
-| Summary | `title` |
-| Description (ADF → text) | `description` |
-| "Acceptance Criteria" section of the description, or `JIRA_ACCEPTANCE_CRITERIA_FIELD` | `acceptanceCriteria[]` |
-| Labels, components, status, priority, URL | `metadata` |
-
-Labels and components are also used by the Impact Analysis Agent for routing — e.g. add the label `repo-b` (or component `payment`) to send a ticket to that repository.
-
-The integration is **read-only**: it never comments on or transitions Jira issues.
+The webhook only tells the pipeline which ticket to look at. The ticket is always re-read from Jira, so a forged request cannot change what runs.
 
 ---
 
-## Pushing to GitHub
+## Using it from Jira
 
-To push this repository to GitHub:
+Only two labels exist, and people set both:
 
-### Step 1: Create a new repository on GitHub
-Go to [github.com/new](https://github.com/new) and create a new repository (e.g. `ai-orchestrator` or `ai-development-orchestrator`). Do not initialize with README or .gitignore since they are already present.
+| Label | Meaning |
+|---|---|
+| `ai-ready` | Plan this ticket, or "I answered / updated it, plan again" |
+| `ai-approved` | I approve the posted plan, implement it |
 
-### Step 2: Initialize Git and Commit
-In your terminal, run:
+The pipeline removes a label once it has acted on it. Everything else happens in comments:
+
+| You see on the ticket | What to do |
+|---|---|
+| **Questions** (yellow panel), options A/B/C with a default | Reply in a comment, e.g. `Q1: A, Q2: B` or in your own words, then add `ai-ready` again |
+| **Not enough information** (red panel), ticket assigned to you | Add the listed details to the ticket or a comment, then add `ai-ready` again |
+| **Change plan** (tables, risk, acceptance criteria, tests, edge cases) | Approve: add `ai-approved`. Request changes: comment them and add `ai-ready` (you get a revised plan). Reject: do nothing |
+| **PR link** | Review and merge it like any other PR |
+| **Stopped, a person needs to look** | Read the reason, fix it, re-add the label |
+
+There is no Slack integration; Jira is the only channel.
+
+---
+
+## Configuration
+
+| File | What it holds |
+|---|---|
+| `ai-orchestrator/.env` | Secrets and connections (see `.env.example`) |
+| `ai-orchestrator/config/pipeline.yaml` | Kill switch, prompt version, planning limits, intake rules (default and per project), Jira field IDs, phase → Jira status mapping. Read fresh before every step, so changes apply without a restart |
+| `ai-orchestrator/config/components.yaml` | Jira component **or label** → repos, product and `risk_floor`. The first thing used to pick repos |
+| `ai-orchestrator/catalog/repos.yaml` | Every repo the pipeline may touch: path, base branch, Bitbucket slug, routing keywords, verify commands |
+| `ai-orchestrator/prompts/planning-v2.md` | The planning agent's instructions, versioned in Git. Change it by adding `planning-v3.md` and setting `prompt_version` |
+
+Current settings for **T2**: no Product or component required, issue types Story, Task and Bug, at most 3 story points. Moving tickets through Jira workflow statuses per phase is mapped in `pipeline.yaml` but **off** (`move_status: false`) until the mapping is agreed.
+
+Repos in the catalog today (all on `main`): gb-homepage-api, gb-payments-api, gb-event-api, gb-onboarding-api, gb-backoffice-api, gb-bo-admin-fe, gamebull-web. `gb-webhook-api-service` is left out because its `main` has no code.
+
+---
+
+## Guardrails
+
+**Entry**
+- Only labelled tickets.
+- Kill switch: `kill_switch: true` in `pipeline.yaml` or `AI_KILL_SWITCH=true`. A broken config counts as "on".
+- One run per ticket; one watcher per machine.
+- Webhook secret or HMAC check, duplicate deliveries dropped, project allowlist.
+
+**Planning agent**
+- Claude Code runs with every built-in tool switched off (no edit, shell or web).
+- Its only tools are ours, each guarded in code:
+  - `read_file`: stays inside the repo (no `../`, no symlink escape), at most 400 lines and 512 KB, refuses dependency folders and secret files (`.env*`, keys, credentials, `*.tfvars`, `*secret*`…).
+  - `search_code`: at most 20 matches and 10 seconds.
+  - `jira_read`: allowed projects only.
+  - `submit_plan`: validated, with one retry.
+- Limits per run: 80 tool calls, $5, 20 minutes.
+- The Jira token reaches only our local tool server, never the agent's process. Per-run files are private and deleted afterwards.
+- Ticket text, comments and code are treated as data; instructions inside them are ignored.
+
+**Decisions**
+- Code applies the decision rule and validation. The AI's own verdict is not used.
+- Money topics (payouts, wallets, odds, withdrawals…) raise risk and make gaps blocking.
+- Loop limits: 2 question rounds, 3 plan revisions, 2 retries for temporary AI failures (usage limit, timeout), then a person.
+
+**People**
+- Nothing is coded without `ai-approved`.
+- The pipeline only comments, removes trigger labels and assigns too-vague tickets back to the reporter.
+
+**Coding phase**
+- Only the approved plan's repos and order.
+- Separate git worktree on `ai/<ticket>`; the agent works in a sandbox copy without secrets.
+- Changes outside the repo, or that delete, skip or weaken tests, are rejected.
+- The pipeline re-runs verify itself.
+- Only `ai/*` branches are pushed, never `main`; nothing is merged or deployed.
+- At most 3 attempts.
+
+---
+
+## Where state is kept
+
+Local files on the machine running the pipeline (gitignored):
+
+| What | Where |
+|---|---|
+| Phase of each ticket, with history | `.jobs/<ticket>/session.json` |
+| Questions asked and the round | `.jobs/<ticket>/questions.json` |
+| Posted plan, version, approver; earlier versions | `.jobs/<ticket>/plan.json`, `plan.md`, `plan.v1.json` |
+| Coding run: stages, branch, commit, PR | `.jobs/<ticket>/job.json` |
+| Pipeline-owned repo clones | `ai-orchestrator/.repos/` |
+| Coding worktrees | `ai-orchestrator/.worktrees/` |
+
+Phases: `planning → needs_input / needs_info / plan_review → approved → coding → pr_open / done`, or `needs_human` when something fails. The session store sits behind an interface, so a database (for example DynamoDB) can replace the files later.
+
+---
+
+## Operations
+
+- **Stop everything new:** set `kill_switch: true` in `config/pipeline.yaml` (applies at the next step, no restart).
+- **See what is happening:** `npm start -- --sessions`, `npm start -- --status T2-123`, and the watcher's log lines.
+- **A ticket is stuck:** check `--status`, read the latest Jira comment, `--unlock` if a lock remains after a crash, then re-add the label.
+- **Cost:** a planning run costs about $0.20–$1.10 on our repos; the cap is $5 per run.
+- **Rotate tokens** regularly. Use a bot account for Jira, not a personal one.
+
+---
+
+## Development
 
 ```bash
-# 1. Initialize git in the root folder
-git init
-
-# 2. Stage all files (respecting .gitignore)
-git add .
-
-# 3. Create initial commit
-git commit -m "feat: complete local AI development orchestrator POC"
-
-# 4. Set main branch
-git branch -M main
-
-# 5. Link to your GitHub remote repository (replace with your repo URL)
-git remote add origin https://github.com/YOUR_USERNAME/YOUR_REPOSITORY.git
-
-# 6. Push to GitHub
-git push -u origin main
+cd ai-orchestrator
+npm run typecheck
+npm test                 # vitest: unit, integration and a real MCP tool-server round trip; no network
+npm run build            # compiles to dist/ (the tool server then runs without tsx)
+npm run qa               # offline QA scenarios on the sample repos
 ```
 
-> **Note for macOS users**: If running `git` displays `xcode-select: note: No developer tools were found, requesting install`, click **Install** on the Apple prompt (or run `xcode-select --install` in terminal) to enable command-line Git. Alternatively, you can publish the repository directly using **GitHub Desktop** or the **Source Control** tab in VS Code.
+See [ai-orchestrator/README.md](ai-orchestrator/README.md) for the code layout and how to add a repo.
 
+---
+
+## Not built yet
+
+| Item | Needs |
+|---|---|
+| Coding phase run on the real repos | One approved test ticket, with a network-restricted sandbox |
+| Bitbucket pull requests | `BITBUCKET_TOKEN` and `bitbucket` + `baseBranch` per repo (already in the catalog) |
+| Jira status moves per phase | Agree the mapping in `pipeline.yaml`, then `move_status: true` |
+| Reminders for unanswered questions (4 h / 24 h / 48 h) | Jira comments with @mentions |
+| Shared database and several tickets at once | DynamoDB backend for the session store |
+| Retries and timeouts on Jira API calls; recovery of tickets left mid-run after a crash | Planned before unattended production use |

@@ -315,7 +315,7 @@ Answer with ONLY one JSON object, no prose, in exactly this shape:
   }
 }
 
-interface ClaudeResult {
+export interface ClaudeResult {
   type?: string;
   subtype?: string;
   is_error?: boolean;
@@ -325,7 +325,7 @@ interface ClaudeResult {
   duration_ms?: number;
 }
 
-function parseResult(raw: string): ClaudeResult {
+export function parseResult(raw: string): ClaudeResult {
   const text = raw.trim();
   try {
     return JSON.parse(text) as ClaudeResult;
@@ -353,7 +353,7 @@ export function parsePlan(text: string): ImplementationPlan {
   return { raw: text.trim() };
 }
 
-function safeEnv(): NodeJS.ProcessEnv {
+export function safeEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ENV_ALLOWLIST) {
     if (process.env[key]) env[key] = process.env[key];
@@ -402,7 +402,7 @@ export async function collectChanges(root: string, before: Map<string, string>):
 }
 
 /** Default runner: spawns the CLI, feeds the prompt on stdin, returns stdout. */
-const runClaudeCli: ClaudeCodeRunner = ({ bin, args, cwd, prompt, env, timeoutMs }) =>
+export const runClaudeCli: ClaudeCodeRunner = ({ bin, args, cwd, prompt, env, timeoutMs }) =>
   new Promise((resolve, reject) => {
     const child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';

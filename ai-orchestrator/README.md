@@ -1,254 +1,58 @@
-# AI Development Orchestrator (Local POC)
+# ai-orchestrator: developer guide
 
-A modular, test-driven local AI development orchestrator built with Node.js and TypeScript. It coordinates a pipeline of specialized agents to analyze, deduplicate, plan, implement, and deterministically test software engineering tasks across multiple repositories.
+How the pipeline works, how to set it up and how to use it from Jira is in the [main README](../README.md). This page covers the code.
 
----
+## Layout
 
-## Architecture Overview
-
-The system decouples high-level coordination from low-level repository modifications and coding models. The overall workflow follows a single-direction pipeline with early exit checks:
-
-```
-Input Task (e.g. PAY-101)
-    │
-    ▼
-[Impact Analysis Agent]   ──► Determines affected repositories, modules, files
-    │
-    ▼
-[Deduplication Agent]     ──► Halts pipeline if task is duplicate/already implemented
-    │
-    ▼
-[Team Agent]              ──► Analyzes dependencies and coordinates Repo Agent(s)
-    │
-    ├─── Repo Agent (repo-a)  ──► Inspects repo, builds context, invokes AI
-    ├─── Repo Agent (repo-b)  ──► Executes in parallel (or sequential if dependent)
-    │
-    ▼
-[AI Provider Abstraction] ──► MockAIProvider (offline, deterministic)
-    │
-    ▼
-[Code Changes Applied]    ──► Safe file mutations scoped to repository boundaries
-    │
-    ▼
-[Testing Agent]           ──► Runs deterministic tests (npm test / test suites)
-    │
-    ▼
-[Structured Result]       ──► OrchestratorResult with status, diffs, & logs
-```
-
----
-
-## Agent Responsibilities
-
-| Agent / Component | Responsibility |
-| :--- | :--- |
-| **Orchestrator** | Owns and controls the end-to-end execution workflow. Dispatches tasks across agents, passes structured typed contexts, enforces error boundaries, and produces the final execution summary. |
-| **Impact Analysis Agent** | Analyzes the incoming task specifications and acceptance criteria to identify impacted repositories, modules, and target files with confidence scores and reasoning. |
-| **Deduplication Agent** | Guards the pipeline against redundant work. Compares the task against completed/in-progress tasks using ID matching and semantic keyword overlap. |
-| **Team Agent** | Coordinates repository-level execution. Generates a dependency graph, schedules independent repositories concurrently via `Promise.all`, and executes dependent repositories sequentially. |
-| **Repo Agent** | Strictly bound to a single repository (`repoId`, `repoPath`). Gathers existing source files, prepares a focused prompt context for the AI model, and safely writes the returned code changes to disk. |
-| **AI Provider Abstraction** | Decouples the reasoning engine from the orchestration logic. Allows swapping between local offline mocks and cloud models without altering agent logic. |
-| **Testing Agent** | Executes deterministic tests (e.g., repository `npm test` suites, syntax verification, contract tests) post-modification. Does not rely on LLM claims that code works. |
-
----
-
-## Project Structure
-
-```
+```text
 ai-orchestrator/
+├── config/
+│   ├── pipeline.yaml          limits, kill switch, intake rules, Jira fields, prompt version
+│   └── components.yaml        Jira component or label → repos, product, risk floor
+├── catalog/repos.yaml         repos the pipeline may touch (path, base branch, verify commands)
+├── prompts/planning-v2.md     planning agent instructions (versioned; v1 kept for history)
 ├── src/
-│   ├── index.ts                           # Entry point and CLI runner
-│   │
-│   ├── orchestrator/
-│   │   └── orchestrator.ts                # Main workflow coordinator
-│   │
+│   ├── index.ts               CLI: --plan, --watch, --webhook, --sessions, --status; wiring
+│   ├── automation/
+│   │   ├── watcher.ts         label-driven flow: plan → questions / send back / plan for review → coding
+│   │   └── webhook-server.ts  POST /webhooks/jira, secret check, dedupe, one-at-a-time queue
 │   ├── agents/
-│   │   ├── impact-analysis/
-│   │   │   └── agent.ts                   # Analyzes task impact on repos
-│   │   ├── deduplication/
-│   │   │   └── agent.ts                   # Task duplication & overlap detection
-│   │   ├── testing/
-│   │   │   └── agent.ts                   # Deterministic test runner
-│   │   └── team-agent/
-│   │       ├── team-agent.ts              # Multi-repo coordinator (parallel/sequential)
-│   │       └── repo-agents/
-│   │           ├── base-repo-agent.ts     # Reusable base logic for repo agents
-│   │           ├── repo-agent-a/
-│   │           │   └── agent.ts           # RepoAgentA (Payment Service)
-│   │           ├── repo-agent-b/
-│   │           │   └── agent.ts           # RepoAgentB (Order Service)
-│   │           └── repo-agent-c/
-│   │               └── agent.ts           # RepoAgentC (Notification Service)
-│   │
-│   ├── providers/
-│   │   └── ai-provider.ts                 # AIProvider interface and MockAIProvider
-│   │
-│   └── models/
-│       └── types.ts                       # Typed domain models, options, and results
-│
-├── repositories/
-│   ├── repo-a/                            # Payment Service sample repo (with test suite)
-│   │   ├── package.json
-│   │   ├── src/server.ts
-│   │   └── tests/test.js
-│   ├── repo-b/                            # Order Service sample repo (with test suite)
-│   │   ├── package.json
-│   │   ├── src/index.ts
-│   │   └── tests/test.js
-│   └── repo-c/                            # Notification Service sample repo (with test suite)
-│       ├── package.json
-│       ├── src/index.ts
-│       └── tests/test.js
-│
-├── tests/
-│   └── orchestrator.test.ts               # Complete Vitest test suite (11 tests)
-│
-├── package.json
-├── tsconfig.json
-├── .env.example
-└── README.md
+│   │   ├── intake/intake.ts   checks before any AI call
+│   │   ├── planning/
+│   │   │   ├── planning-agent.ts  runs Claude Code with only our tools; collects the result
+│   │   │   ├── tools.ts           the 5 tools and their guards
+│   │   │   ├── mcp-server.ts      serves the tools to Claude Code (local, per run)
+│   │   │   ├── plan-rules.ts      normalise, decision rule, validation, risk floor, coding brief
+│   │   │   ├── render-adf.ts      formatted Jira comments (plan, questions, missing info)
+│   │   │   ├── render.ts          plain-text versions (terminal and fallback)
+│   │   │   └── types.ts           plan, checklist and edge-case types
+│   │   ├── deduplication/, impact-analysis/, team-agent/, testing/   coding phase (from the POC)
+│   ├── catalog/               service catalog and component map loaders
+│   ├── config/                pipeline.yaml loader and validation
+│   ├── integrations/          Jira and Bitbucket REST clients
+│   ├── jobs/                  session store (phases), job store, locks
+│   ├── providers/             AI providers: claude-code, claude, handoff, mock
+│   └── workspace/             git worktree per ticket
+├── tests/                     vitest suites; tests/fixtures/sample-catalog.yaml for the demo repos
+└── repositories/              sample repos repo-a/b/c, used only by tests, QA and --demo
 ```
 
----
+## Tests
 
-## How AI Providers Work
-
-### 1. `MockAIProvider` (Default)
-- **Zero API keys required**: Runs completely offline.
-- **Transparent and deterministic**: Generates realistic code changes based on the task description and acceptance criteria (e.g., implementing `GET /health` with `status: 'UP'` for `PAY-101`).
-- Accurately reports its provider name as `'mock'` so audit trails reflect that mock reasoning was used.
-
-All providers implement the same interface, so another AI can be plugged in later without changing agent code:
-```typescript
-export interface AIProvider {
-  readonly name: string;
-  generateChanges(options: AIProviderGenerateOptions): Promise<AIProviderResponse>;
-}
+```bash
+npm test            # 205 tests, no network, no Jira, no Claude
+npm run typecheck
 ```
 
----
+`tests/planner-tools.test.ts` starts the real MCP tool server over stdio. Everything else uses fakes for Jira, Bitbucket and Claude.
 
-## Execution Flow & Demo
+## Adding a repo
 
-When running `npm start`, the demo executes two scenarios:
+1. Clone it into `.repos/<name>` on its base branch.
+2. Add it to `catalog/repos.yaml`: `id`, `name`, `purpose`, `path: ../.repos/<name>`, `baseBranch`, `bitbucket`, `keywords`, `verify` (start with the install step).
+3. Map its Jira components or area labels in `config/components.yaml`, with a `risk_floor` (`high` for money).
+4. Run `npm test`: a test checks that both config files load and agree with the catalog.
 
-### Scenario 1: New Task (`PAY-101`)
-```
-[ORCHESTRATOR]
-Task received: PAY-101 - Add health endpoint
+## Changing the planning prompt
 
-[IMPACT ANALYSIS]
-Analyzing affected repositories...
-Identified 1 affected repo(s): repo-a (Confidence: 95%)
-
-[DEDUPLICATION]
-Checking for duplicate/overlapping work...
-Task status: NEW (No duplicate or overlapping work found in task history.)
-
-[TEAM AGENT]
-Coordinating work across repositories: repo-a
-
-[MOCK]
-Generating implementation...
-
-[TESTING]
-Running tests on modified repositories...
-
-[RESULT]
-Success
-```
-
-### Scenario 2: Duplicate Task Submission
-```
-[ORCHESTRATOR]
-Task received: PAY-101 - Add health endpoint
-
-[IMPACT ANALYSIS]
-Analyzing affected repositories...
-
-[DEDUPLICATION]
-Checking for duplicate/overlapping work...
-Task flagged as DUPLICATE of PAY-101. Halting pipeline.
-Reason: Task with ID PAY-101 has already been processed (status: COMPLETED).
-
-[RESULT]
-Failed: Task is duplicate
-```
-
----
-
-## How to Run the Local POC
-
-### Prerequisites
-- Node.js 18+ (tested on Node.js v20)
-- npm
-
-### Installation & Run
-
-1. Navigate to the project directory:
-   ```bash
-   cd ai-orchestrator
-   ```
-
-2. Install dependencies:
-   ```bash
-   npm install
-   ```
-
-### Available Commands
-
-| Command | Purpose |
-| :--- | :--- |
-| `npm start` | Runs the main CLI demo (Scenario 1 new task + Scenario 2 duplicate detection). |
-| `npm run qa` | Runs the automated QA suite across 6 sample tickets (single repo, parallel multi-repo, dependent sequential, deduplication). |
-| `npm run clean` | Revokes all generated code and resets repositories and `.task-history.json` to baseline. |
-| `npm test` | Runs the complete 12-test Vitest test suite. |
-| `npm run typecheck` | Runs TypeScript compiler checks (`tsc --noEmit`). |
-
----
-
-## How to Add Another Repo Agent
-
-Every repository is managed by an instance of `RepoAgent`. To add a new repository:
-
-1. **Create the repository directory**:
-   ```bash
-   mkdir -p repositories/repo-c/src
-   mkdir -p repositories/repo-c/tests
-   ```
-
-2. **Add a package descriptor and deterministic test**:
-   - `repositories/repo-c/package.json` with `"scripts": { "test": "node tests/test.js" }`
-   - `repositories/repo-c/tests/test.js` validating the repository invariants.
-
-3. **Register impact rules in `ImpactAnalysisAgent`**:
-   Add keyword routing to `customRules`:
-   ```typescript
-   {
-     keywords: ['notification', 'email', 'sms', 'repo-c'],
-     repositories: ['repo-c'],
-     modules: ['notification-service']
-   }
-   ```
-
-4. **Define dependencies (optional)**:
-   In `TeamAgentConfig`, if `repo-c` depends on `repo-a`, pass:
-   ```typescript
-   dependencies: {
-     'repo-c': ['repo-a']
-   }
-   ```
-   Independent repositories automatically execute in parallel; dependent repositories will wait until upstream repositories complete successfully.
-
----
-
-## Future Architecture Extensions
-
-Because each component adheres to an explicit interface, future integrations can be slotted in without rewriting orchestration logic:
-
-1. **Jira Integration**: Swap or extend `TaskInput` ingestion by querying the Jira REST API for issues transitioned to "Ready for Dev".
-2. **Bitbucket / Git Provider**: Wrap `RepoAgent` with git branch management (`git checkout -b feature/PAY-101`) and automated pull request creation.
-3. **Jenkins / CI Agent**: In `TestingAgent`, trigger a remote Jenkins job via webhook or webhook polling in addition to local deterministic test suites.
-4. **Postman / Newman Agent**: Add an integration test stage in `TestingAgent` running automated Newman collections against a local ephemeral container.
-5. **Telemetry & SigNoz**: Instrument the orchestrator lifecycle using OpenTelemetry spans around each agent step, emitting traces to a SigNoz collector.
-
+Add `prompts/planning-v3.md`, set `prompt_version: planning-v3` in `config/pipeline.yaml`, and run the same set of test tickets with `npm start -- --plan <key>` before and after. Every plan records the prompt version it was made with.

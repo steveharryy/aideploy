@@ -9,3 +9,6 @@ coverage/
 .jobs/
 .worktrees/
 .handoff/
+
+# Pipeline-owned clean clones of real repos (default branch)
+.repos/

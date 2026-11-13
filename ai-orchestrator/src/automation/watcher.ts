@@ -2,26 +2,25 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { OrchestratorResult, TaskInput } from '../models/types.js';
 import type { ImplementationPlan } from '../providers/claude-code-provider.js';
+import type { PlanQuestion, TicketPlan } from '../agents/planning/types.js';
+import { renderMissing, renderQuestions } from '../agents/planning/render.js';
+import { missingInfoCommentAdf, planCommentAdf, questionsCommentAdf, type AdfNode } from '../agents/planning/render-adf.js';
+import { FileSessionStore, type SessionPhase, type SessionStore } from '../jobs/session-store.js';
+import { redactSecrets, safeErrorMessage } from '../util/redact.js';
 
-/** Jira labels that drive the automation (configurable via env). */
+/**
+ * The only labels in Jira: the two HUMAN triggers. The bot removes a trigger once it has acted
+ * on it. Where a ticket is in the pipeline (its phase) is kept in our session store, and shown in
+ * Jira through comments and, optionally, the project's own workflow statuses.
+ */
 export interface WatcherLabels {
-  ready: string; // human: "please pick this up"
-  planPending: string; // bot: plan posted, waiting for approval
+  ready: string; // human: "please plan this" (also: "I answered / updated the ticket, plan again")
   approved: string; // human: "plan approved, implement it"
-  inProgress: string; // bot: implementing now
-  prRaised: string; // bot: PR opened
-  done: string; // bot: implemented, no PR (repo is not a git clone)
-  needsHuman: string; // bot: stopped, a person must look
 }
 
 export const DEFAULT_LABELS: WatcherLabels = {
   ready: 'ai-ready',
-  planPending: 'ai-plan-pending',
-  approved: 'ai-approved',
-  inProgress: 'ai-in-progress',
-  prRaised: 'ai-pr-raised',
-  done: 'ai-done',
-  needsHuman: 'ai-needs-human'
+  approved: 'ai-approved'
 };
 
 export interface WatcherConfig {
@@ -32,20 +31,44 @@ export interface WatcherConfig {
   autoApprove: boolean;
   /** Stop after this many implementation attempts per ticket. */
   maxAttempts: number;
-  /** Optional Jira status names to move tickets to (skipped if unset or not in the workflow). */
-  statusInProgress?: string;
-  statusInReview?: string;
+  /**
+   * Existing Jira workflow status to move a ticket to when it enters a phase (per project, from
+   * config). Undefined = leave the status alone. A missing transition is logged, never fatal.
+   */
+  statusForPhase?: (ticket: string, phase: SessionPhase) => string | undefined;
   /** Report what would happen; no Jira writes, no AI runs. */
   dryRun: boolean;
+  /** Rounds of blocking questions before the ticket is sent back as too vague (default 2). */
+  maxQuestionRounds?: number;
+  /** "Request changes" rounds on a plan before the ticket is sent back (default 3). */
+  maxPlanRevisions?: number;
+  /** Assign the ticket back to its reporter when it is sent back for more information. */
+  assignToReporter?: boolean;
+  /**
+   * A ticket still in "planning" / "coding" after this long without any update is treated as left
+   * behind by a crash or restart and handed to a person (defaults: 45 min / 3 h).
+   */
+  stalePlanningMs?: number;
+  staleCodingMs?: number;
 }
 
 /** Result of the planning phase for one ticket. */
 export interface PlanOutcome {
-  status: 'ready' | 'duplicate' | 'no-repo' | 'error';
+  /** retry-later: a temporary problem (AI usage/rate limit, overload). Nothing is posted; the trigger stays for the next cycle. */
+  status: 'ready' | 'duplicate' | 'no-repo' | 'error' | 'needs-input' | 'needs-info' | 'retry-later';
   reason?: string;
   repos: string[];
-  plans: Record<string, ImplementationPlan>;
+  /** Per-repo brief handed to the coding agent. */
+  plans: Record<string, ImplementationPlan | Record<string, unknown>>;
   text: string;
+  /** Structured plan from the Planning Agent (claude-code provider). */
+  ticketPlan?: TicketPlan;
+  /** Repo → repos it waits for, from the plan's work items. */
+  repoDependencies?: Record<string, string[]>;
+  promptVersion?: string;
+  costUsd?: number;
+  /** Per-repo branch / verify / rollback, for the plan comment. */
+  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }>;
 }
 
 export interface PullRequestLink {
@@ -58,8 +81,14 @@ export interface SavedPlan {
   ticketId: string;
   createdAt: string;
   repos: string[];
-  plans: Record<string, ImplementationPlan>;
+  plans: Record<string, ImplementationPlan | Record<string, unknown>>;
   text: string;
+  ticketPlan?: TicketPlan;
+  repoDependencies?: Record<string, string[]>;
+  /** 1 for the first plan, +1 for every revision after "request changes". */
+  version?: number;
+  promptVersion?: string;
+  costUsd?: number;
   approvedBy?: string;
   approvedAt?: string;
 }
@@ -68,9 +97,12 @@ export interface WatcherJira {
   searchTasks(jql: string, maxResults?: number): Promise<TaskInput[]>;
   getTask(key: string): Promise<TaskInput>;
   addComment(key: string, lines: string[], preformatted?: string): Promise<void>;
+  /** Rich comment (Atlassian Document Format). Optional: without it the plain comment is used. */
+  addCommentDoc?(key: string, body: AdfNode): Promise<void>;
   updateLabels(key: string, add?: string[], remove?: string[]): Promise<void>;
   transition(key: string, statusName: string): Promise<boolean>;
   getLabelAdder(key: string, label: string): Promise<string | undefined>;
+  assign?(key: string, accountId: string): Promise<void>;
 }
 
 export interface WatcherDeps {
@@ -83,6 +115,10 @@ export interface WatcherDeps {
   publish(task: TaskInput, result: OrchestratorResult, plan: SavedPlan): Promise<{ links: PullRequestLink[]; skipped: string[] }>;
   /** Implementation attempts already made for this ticket (from the job record). */
   attempts(ticketId: string): number;
+  /** Checked before every step: true = start nothing new. */
+  killSwitch?(): boolean;
+  /** Where each ticket's phase is kept (default: files under jobsDir). */
+  sessions?: SessionStore;
   jobsDir: string;
   log(message: string): void;
 }
@@ -95,6 +131,8 @@ export type TicketAction =
   | 'no-repo'
   | 'failed'
   | 'waiting-approval'
+  | 'needs-input'
+  | 'needs-info'
   | 'retry-limit'
   | 'skipped';
 
@@ -104,6 +142,8 @@ export interface CycleReport {
 }
 
 const BOT = '🤖 AI Orchestrator';
+/** Temporary planning failures (usage limit, timeout…) retried before a person is asked to look. */
+const MAX_TEMPORARY_RETRIES = 2;
 
 /**
  * AutomationWatcher
@@ -117,7 +157,11 @@ const BOT = '🤖 AI Orchestrator';
  * Labels are the only trigger (comments are ignored), so the bot never reacts to itself.
  */
 export class AutomationWatcher {
-  constructor(private config: WatcherConfig, private deps: WatcherDeps) {}
+  readonly sessions: SessionStore;
+
+  constructor(private config: WatcherConfig, private deps: WatcherDeps) {
+    this.sessions = deps.sessions ?? new FileSessionStore(deps.jobsDir);
+  }
 
   private planFile(ticketId: string): string {
     return path.join(this.deps.jobsDir, ticketId.replace(/[^A-Za-z0-9._-]/g, '_'), 'plan.json');
@@ -144,6 +188,25 @@ export class AutomationWatcher {
     );
   }
 
+  private questionsFile(ticketId: string): string {
+    return path.join(this.deps.jobsDir, ticketId.replace(/[^A-Za-z0-9._-]/g, '_'), 'questions.json');
+  }
+
+  /** Blocking-question rounds asked so far for a ticket. */
+  readQuestionState(ticketId: string): { rounds: number; questions: PlanQuestion[] } {
+    try {
+      return JSON.parse(fs.readFileSync(this.questionsFile(ticketId), 'utf-8'));
+    } catch {
+      return { rounds: 0, questions: [] };
+    }
+  }
+
+  private saveQuestionState(ticketId: string, state: { rounds: number; questions: PlanQuestion[] }): void {
+    const file = this.questionsFile(ticketId);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ ...state, updatedAt: new Date().toISOString() }, null, 2));
+  }
+
   private hasLabel(task: TaskInput, label: string): boolean {
     const labels = task.metadata?.labels;
     return Array.isArray(labels) && labels.includes(label);
@@ -151,11 +214,71 @@ export class AutomationWatcher {
 
   // Jira writes are no-ops in dry-run mode.
   private async comment(key: string, lines: string[], pre?: string) {
-    if (!this.config.dryRun) await this.deps.jira.addComment(key, [BOT, ...lines], pre);
+    if (!this.config.dryRun) await this.deps.jira.addComment(key, [BOT, ...lines].map(redactSecrets), pre === undefined ? undefined : redactSecrets(pre));
   }
-  private async labels(key: string, add: string[], remove: string[]) {
-    if (!this.config.dryRun) await this.deps.jira.updateLabels(key, add, remove);
+  /**
+   * Records the ticket's new phase in our store, removes the human trigger label(s) the bot has
+   * acted on, and moves the Jira status if the project maps this phase to one.
+   */
+  private async toPhase(key: string, phase: SessionPhase, consume: string[], detail?: string) {
+    if (this.config.dryRun) return;
+    this.sessions.setPhase(key, phase, detail === undefined ? undefined : redactSecrets(detail));
+    if (consume.length) await this.deps.jira.updateLabels(key, [], consume);
+    await this.move(key, this.config.statusForPhase?.(key, phase));
   }
+  /** Temporary-failure retries since the last real outcome (read from the session history). */
+  private consecutiveRetries(ticketId: string): number {
+    let n = 0;
+    for (const h of [...(this.sessions.get(ticketId)?.history ?? [])].reverse()) {
+      if (h.phase !== 'planning') break;
+      if (h.detail?.startsWith('waiting to retry')) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Starts the question rounds and plan revisions from zero. Used when a plan is posted and when the
+   * ticket goes back to the reporter, so a rewritten ticket is not judged by an old round count.
+   */
+  private resetRounds(ticketId: string, archivePlan: boolean): void {
+    const dir = path.dirname(this.questionsFile(ticketId));
+    fs.rmSync(this.questionsFile(ticketId), { force: true });
+    if (archivePlan && fs.existsSync(this.planFile(ticketId)) && !this.readPlan(ticketId)?.approvedAt) {
+      fs.renameSync(this.planFile(ticketId), path.join(dir, `plan.superseded-${Date.now()}.json`));
+    }
+  }
+
+  /**
+   * Rich (Jira-formatted) comment, falling back to the plain one if Jira rejects it or the client
+   * cannot send rich comments: a comment is never lost to formatting.
+   */
+  private async richComment(key: string, body: AdfNode, fallbackLines: string[], fallbackPre?: string) {
+    if (this.config.dryRun) return;
+    if (this.deps.jira.addCommentDoc) {
+      try {
+        await this.deps.jira.addCommentDoc(key, body);
+        return;
+      } catch (err) {
+        this.deps.log(`${key}: rich comment rejected, posting plain text instead: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+    await this.comment(key, fallbackLines, fallbackPre);
+  }
+
+  /** Too vague: comment what is missing, record the phase, and give the ticket back to its reporter. */
+  private async sendBack(task: TaskInput, lines: string[], consume: string[], rich?: AdfNode) {
+    if (rich) await this.richComment(task.id, rich, lines);
+    else await this.comment(task.id, lines);
+    if (!this.config.dryRun) this.resetRounds(task.id, true);
+    await this.toPhase(task.id, 'needs_info', consume, lines[0]);
+    const reporter = (task.metadata?.reporter as { accountId?: string } | undefined)?.accountId;
+    if (this.config.assignToReporter && reporter && this.deps.jira.assign && !this.config.dryRun) {
+      await this.deps.jira.assign(task.id, reporter).catch((err) =>
+        this.deps.log(`${task.id}: could not assign to the reporter: ${err instanceof Error ? err.message : String(err)}`)
+      );
+    }
+  }
+
   private async move(key: string, status?: string) {
     if (!status || this.config.dryRun) return;
     try {
@@ -168,28 +291,95 @@ export class AutomationWatcher {
 
   /** One polling cycle. */
   async runOnce(): Promise<CycleReport> {
-    const L = this.config.labels;
     const report: CycleReport = { checked: 0, actions: [] };
+    if (this.deps.killSwitch?.()) {
+      this.deps.log('kill switch is on: not looking for tickets');
+      return report;
+    }
+    await this.sweepStale();
     const tasks = await this.deps.jira.searchTasks(this.config.jql, 50);
     report.checked = tasks.length;
 
     for (const task of tasks) {
-      try {
-        const action = this.hasLabel(task, L.approved)
-          ? await this.handleApproved(task)
-          : this.hasLabel(task, L.ready)
-            ? await this.handleReady(task)
-            : 'skipped';
-        report.actions.push({ ticket: task.id, action });
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        this.deps.log(`${task.id}: unexpected error: ${message}`);
-        report.actions.push({ ticket: task.id, action: 'failed', detail: message });
-        await this.comment(task.id, ['Stopped because of an unexpected error. A person needs to look at this.', `Error: ${message}`]).catch(() => {});
-        await this.labels(task.id, [L.needsHuman], [L.ready, L.approved, L.inProgress]).catch(() => {});
-      }
+      const { action, detail } = await this.processTask(task);
+      report.actions.push({ ticket: task.id, action, ...(detail ? { detail } : {}) });
     }
     return report;
+  }
+
+  /** Runs one ticket by key (e.g. from a webhook). The ticket is re-read, so its labels decide. */
+  async runTicket(key: string): Promise<{ action: TicketAction; detail?: string }> {
+    await this.sweepStale();
+    const task = await this.deps.jira.getTask(key);
+    return this.processTask(task);
+  }
+
+  /** Routes a ticket by its labels; any error is reported on the ticket and handed to a human. */
+  private async processTask(task: TaskInput): Promise<{ action: TicketAction; detail?: string }> {
+    const L = this.config.labels;
+    if (this.deps.killSwitch?.()) {
+      this.deps.log(`${task.id}: kill switch is on, not started`);
+      return { action: 'skipped', detail: 'kill switch on' };
+    }
+    const triggers = [L.approved, L.ready].filter((l) => this.hasLabel(task, l));
+    if (triggers.length === 0) return { action: 'skipped' };
+
+    // Claim first: remove the trigger label BEFORE any paid work. If Jira refuses (no Edit
+    // permission, outage), nothing runs, so a ticket can never be re-planned every cycle.
+    if (!this.config.dryRun) {
+      try {
+        await this.deps.jira.updateLabels(task.id, [], triggers);
+      } catch (err) {
+        const message = safeErrorMessage(err);
+        this.deps.log(`${task.id}: not started, could not remove the trigger label (${triggers.join(', ')}): ${message}`);
+        this.sessions.setPhase(task.id, this.sessions.get(task.id)?.phase ?? 'needs_human', `could not claim ticket: ${message}`);
+        return { action: 'failed', detail: `could not claim ticket: ${message}` };
+      }
+    }
+    try {
+      const action = triggers.includes(L.approved) ? await this.handleApproved(task) : await this.handleReady(task);
+      return { action };
+    } catch (err) {
+      const message = safeErrorMessage(err);
+      this.deps.log(`${task.id}: unexpected error: ${message}`);
+      await this.comment(task.id, ['Stopped because of an unexpected error. A person needs to look at this.', `Error: ${message}`]).catch(() => {});
+      await this.toPhase(task.id, 'needs_human', [], `error: ${message}`).catch(() => {});
+      return { action: 'failed', detail: message };
+    }
+  }
+
+  /**
+   * Tickets left in "planning" or "coding" by a crash or restart (no update for too long) are
+   * handed to a person with a Jira comment, instead of sitting there with no label and no alert.
+   * A ticket waiting for a planned retry (its label is back on) is left alone.
+   */
+  async sweepStale(now = Date.now()): Promise<string[]> {
+    if (this.config.dryRun) return [];
+    const L = this.config.labels;
+    const limits: Partial<Record<SessionPhase, number>> = {
+      planning: this.config.stalePlanningMs ?? 45 * 60 * 1000,
+      coding: this.config.staleCodingMs ?? 3 * 60 * 60 * 1000
+    };
+    const swept: string[] = [];
+    for (const s of this.sessions.list()) {
+      const limit = limits[s.phase];
+      if (!limit || now - Date.parse(s.updatedAt) < limit) continue;
+      if (s.phase === 'planning' && s.detail?.startsWith('waiting to retry')) continue;
+      const what = s.phase === 'coding' ? 'implementing' : 'planning';
+      const retryLabel = s.phase === 'coding' ? L.approved : L.ready;
+      this.deps.log(`${s.ticket}: stuck in ${s.phase} since ${s.updatedAt} → needs_human`);
+      try {
+        await this.comment(s.ticket, [
+          `The pipeline stopped while ${what} this ticket (no progress since ${s.updatedAt.slice(0, 16).replace('T', ' ')} UTC), probably a restart or crash.`,
+          `Nothing was posted or merged. To try again, add the label "${retryLabel}".`
+        ]);
+      } catch (err) {
+        this.deps.log(`${s.ticket}: could not post the stuck-ticket comment: ${safeErrorMessage(err)}`);
+      }
+      this.sessions.setPhase(s.ticket, 'needs_human', `stuck in ${s.phase} (no update since ${s.updatedAt})`);
+      swept.push(s.ticket);
+    }
+    return swept;
   }
 
   /** ai-ready: dedup → impact → change plan → Jira comment → waiting for approval. */
@@ -197,26 +387,104 @@ export class AutomationWatcher {
     const L = this.config.labels;
     this.deps.log(`${task.id}: picked up (${L.ready}) → planning`);
     if (this.config.dryRun) return 'planned';
+    this.sessions.setPhase(task.id, 'planning');
 
+    const questionState = this.readQuestionState(task.id);
+    if (questionState.questions.length) {
+      task.metadata = { ...(task.metadata || {}), previousQuestions: questionState.questions };
+    }
+    const clear = [L.ready];
+    // A plan that was posted but not approved: re-plan using the reviewer's comments.
+    const prior = this.readPlan(task.id);
+    const revising = !!(prior?.ticketPlan && !prior.approvedAt);
+    const version = revising ? (prior!.version ?? 1) + 1 : 1;
+    const maxRevisions = this.config.maxPlanRevisions ?? 3;
+    if (revising && version > maxRevisions + 1) {
+      this.deps.log(`${task.id}: plan revised ${maxRevisions} times without approval → back to reporter`);
+      await this.sendBack(task, [
+        `The plan for ${task.id} was revised ${maxRevisions} times without being approved.`,
+        'Please clarify the ticket (expected behaviour, scope, examples) so a plan can be agreed, or plan it by hand.',
+        `Then add the label "${L.ready}" again.`
+      ], clear);
+      return 'needs-info';
+    }
+    if (revising) {
+      task.metadata = { ...(task.metadata || {}), previousPlan: prior!.ticketPlan };
+      // Keep the version being replaced, so the approver can compare v1 with v2.
+      if (!this.config.dryRun) {
+        const dir = path.dirname(this.planFile(task.id));
+        fs.copyFileSync(this.planFile(task.id), path.join(dir, `plan.v${prior!.version ?? 1}.json`));
+      }
+    }
     const outcome = await this.deps.plan(task);
 
+    if (outcome.status === 'retry-later') {
+      // Capped: after MAX_TEMPORARY_RETRIES temporary failures in a row, a person looks at it.
+      const retries = this.consecutiveRetries(task.id);
+      if (retries < MAX_TEMPORARY_RETRIES) {
+        this.deps.log(`${task.id}: temporary problem, will retry next cycle (${retries + 1}/${MAX_TEMPORARY_RETRIES}): ${redactSecrets(outcome.reason ?? '-')}`);
+        this.sessions.setPhase(task.id, 'planning', `waiting to retry: ${redactSecrets(outcome.reason ?? '').slice(0, 200)}`);
+        // The label was claimed at the start; put it back so the next cycle picks the ticket up.
+        if (!this.config.dryRun) {
+          await this.deps.jira.updateLabels(task.id, [L.ready], []).catch((err) =>
+            this.deps.log(`${task.id}: could not re-add "${L.ready}" for the retry: ${safeErrorMessage(err)}`)
+          );
+        }
+        return 'skipped';
+      }
+      outcome.status = 'error';
+      outcome.reason = `${outcome.reason ?? ''} (still failing after ${retries} retries)`;
+    }
     if (outcome.status === 'duplicate') {
       await this.comment(task.id, ['Not started: this looks like work that is already done.', `Reason: ${outcome.reason ?? '-'}`]);
-      await this.labels(task.id, [L.needsHuman], [L.ready]);
+      await this.toPhase(task.id, 'needs_human', clear, `duplicate: ${outcome.reason ?? ''}`);
       return 'duplicate';
     }
     if (outcome.status === 'no-repo') {
       await this.comment(task.id, [
         'Not started: no repository matched this ticket.',
-        'Add a label/component for the target repo, or add the repo to catalog/repos.yaml, then put the ai-ready label back.'
+        `Add a component for the target repo, or add the repo to catalog/repos.yaml, then add the label "${L.ready}" again.`
       ]);
-      await this.labels(task.id, [L.needsHuman], [L.ready]);
+      await this.toPhase(task.id, 'needs_human', clear, 'no matching repository');
       return 'no-repo';
     }
     if (outcome.status === 'error') {
-      await this.comment(task.id, ['Planning failed. A person needs to look at this.', `Error: ${outcome.reason ?? '-'}`]);
-      await this.labels(task.id, [L.needsHuman], [L.ready]);
+      await this.comment(task.id, ['Planning failed. A person needs to look at this.', `Error: ${outcome.reason ?? '-'}`], outcome.text || undefined);
+      await this.toPhase(task.id, 'needs_human', clear, `planning failed: ${outcome.reason ?? ''}`);
       return 'failed';
+    }
+
+    const maxRounds = this.config.maxQuestionRounds ?? 2;
+    if (outcome.status === 'needs-input' && outcome.ticketPlan) {
+      if (questionState.rounds >= maxRounds) {
+        // Still blocked after the allowed rounds: hand back to the reporter instead of asking forever.
+        const plan: TicketPlan = {
+          ...outcome.ticketPlan,
+          readiness: 'too_vague',
+          missingForReporter: [
+            `Still unclear after ${questionState.rounds} round(s) of questions. Open points:`,
+            ...outcome.ticketPlan.questions.map((q) => `${q.id}. ${q.text}`)
+          ]
+        };
+        this.deps.log(`${task.id}: still blocked after ${questionState.rounds} question round(s) → back to reporter`);
+        await this.sendBack(task, renderMissing(plan, L.ready), clear, missingInfoCommentAdf(plan, L.ready));
+        return 'needs-info';
+      }
+      const round = questionState.rounds + 1;
+      this.saveQuestionState(task.id, { rounds: round, questions: outcome.ticketPlan.questions });
+      this.deps.log(`${task.id}: ${outcome.ticketPlan.questions.length} blocking question(s) (round ${round}/${maxRounds})`);
+      await this.richComment(
+        task.id,
+        questionsCommentAdf(outcome.ticketPlan, L.ready, round, maxRounds),
+        renderQuestions(outcome.ticketPlan, L.ready, round, maxRounds)
+      );
+      await this.toPhase(task.id, 'needs_input', clear, `round ${round}: ${outcome.ticketPlan.questions.length} question(s)`);
+      return 'needs-input';
+    }
+    if (outcome.status === 'needs-info' && outcome.ticketPlan) {
+      this.deps.log(`${task.id}: too vague → back to reporter`);
+      await this.sendBack(task, renderMissing(outcome.ticketPlan, L.ready), clear, missingInfoCommentAdf(outcome.ticketPlan, L.ready));
+      return 'needs-info';
     }
 
     const saved: SavedPlan = {
@@ -224,7 +492,12 @@ export class AutomationWatcher {
       createdAt: new Date().toISOString(),
       repos: outcome.repos,
       plans: outcome.plans,
-      text: outcome.text
+      text: outcome.text,
+      ...(outcome.ticketPlan ? { ticketPlan: outcome.ticketPlan } : {}),
+      ...(outcome.repoDependencies ? { repoDependencies: outcome.repoDependencies } : {}),
+      ...(outcome.ticketPlan ? { version } : {}),
+      ...(outcome.promptVersion ? { promptVersion: outcome.promptVersion } : {}),
+      ...(outcome.costUsd !== undefined ? { costUsd: outcome.costUsd } : {})
     };
 
     if (this.config.autoApprove) {
@@ -232,22 +505,41 @@ export class AutomationWatcher {
       saved.approvedAt = new Date().toISOString();
       this.savePlan(saved);
       await this.comment(task.id, ['Change plan (auto-approved, implementation starts now):'], outcome.text);
-      await this.labels(task.id, [L.approved], [L.ready]);
+      await this.toPhase(task.id, 'approved', clear, 'auto-approved');
       task.metadata = { ...(task.metadata || {}), labels: [L.approved] };
       return this.handleApproved(task);
     }
 
     this.savePlan(saved);
-    await this.comment(
-      task.id,
-      [
-        `Change plan for ${task.id} is ready for review. Repos: ${outcome.repos.join(', ')}.`,
-        `To approve: add the label "${L.approved}". To reject: remove "${L.planPending}" (optionally comment why).`,
+    this.resetRounds(task.id, false); // a posted plan closes the question rounds
+    const plainPlanLines = [
+        `Change plan${saved.version && saved.version > 1 ? ` v${saved.version} (revised)` : ''} for ${task.id} is ready for review. Repos: ${outcome.repos.join(', ')}.`,
+        ...(outcome.ticketPlan?.warnings.length
+          ? [`⚠ ${outcome.ticketPlan.warnings.length} warning(s) in this plan: read them before approving.`, ...outcome.ticketPlan.warnings.map((w) => `⚠ ${w}`)]
+          : []),
+        `To approve: add the label "${L.approved}".`,
+        `To request changes: comment what to change, then add the label "${L.ready}" again (the plan is revised using your comments).`,
+        'To reject: do nothing (optionally comment why); the ticket stays as it is.',
         'Nothing has been changed yet.'
-      ],
-      outcome.text
-    );
-    await this.labels(task.id, [L.planPending], [L.ready]);
+    ];
+    if (outcome.ticketPlan) {
+      await this.richComment(
+        task.id,
+        planCommentAdf(outcome.ticketPlan, {
+          version: saved.version,
+          readyLabel: L.ready,
+          approvedLabel: L.approved,
+          promptVersion: outcome.promptVersion,
+          costUsd: outcome.costUsd,
+          repoFacts: outcome.repoFacts
+        }),
+        plainPlanLines,
+        outcome.text
+      );
+    } else {
+      await this.comment(task.id, plainPlanLines, outcome.text);
+    }
+    await this.toPhase(task.id, 'plan_review', clear, `plan v${saved.version ?? 1}`);
     return 'planned';
   }
 
@@ -260,7 +552,7 @@ export class AutomationWatcher {
       // Approval without a plan on record: plan first, the approval must come after the plan.
       this.deps.log(`${task.id}: "${L.approved}" found but no plan on record → planning first`);
       if (this.config.dryRun) return 'planned';
-      await this.labels(task.id, [], [L.approved]);
+      await this.deps.jira.updateLabels(task.id, [], [L.approved]);
       await this.comment(task.id, [`"${L.approved}" was added before a change plan existed. Drafting the plan first; approve it once you have reviewed it.`]);
       return this.handleReady(task);
     }
@@ -272,7 +564,7 @@ export class AutomationWatcher {
       await this.comment(task.id, [
         `Not started: ${attempts} implementation attempts already made (limit ${this.config.maxAttempts}). Handing over to a person.`
       ]);
-      await this.labels(task.id, [L.needsHuman], [L.approved, L.planPending]);
+      await this.toPhase(task.id, 'needs_human', [L.approved], `retry limit (${attempts})`);
       return 'retry-limit';
     }
 
@@ -285,15 +577,19 @@ export class AutomationWatcher {
       this.savePlan(plan);
     }
 
-    await this.labels(task.id, [L.inProgress], [L.approved, L.planPending]);
-    await this.move(task.id, this.config.statusInProgress);
+    await this.toPhase(task.id, 'coding', [L.approved], `attempt ${attempts + 1}, approved by ${plan.approvedBy}`);
     await this.comment(task.id, [
       `Plan approved by ${plan.approvedBy}. Implementation started: tests first, then the code, then the repo's verify steps.`
     ]);
 
     // Fresh ticket data (description/comments may have changed), carrying the approved plan.
     const fresh = await this.deps.jira.getTask(task.id);
-    fresh.metadata = { ...(fresh.metadata || {}), approvedPlans: plan.plans };
+    fresh.metadata = {
+      ...(fresh.metadata || {}),
+      approvedPlans: plan.plans,
+      // With a structured plan, the plan (not keyword routing) decides repos and order.
+      ...(plan.ticketPlan ? { approvedRepos: plan.repos, approvedRepoDependencies: plan.repoDependencies || {} } : {})
+    };
     const result = await this.deps.implement(fresh);
 
     const changed = (result.teamResult?.repoResults ?? []).map((r) => `${r.repoId}: ${r.changedFiles.join(', ') || 'no file changes'}`);
@@ -310,7 +606,7 @@ export class AutomationWatcher {
         [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), 'A person needs to look at this. To retry, add the approval label again.'],
         failedCheck || undefined
       );
-      await this.labels(task.id, [L.needsHuman], [L.inProgress]);
+      await this.toPhase(task.id, 'needs_human', [], `implementation stopped: ${result.status}`);
       return 'failed';
     }
 
@@ -324,8 +620,7 @@ export class AutomationWatcher {
         'Verify:',
         ...verify
       ]);
-      await this.labels(task.id, [L.prRaised], [L.inProgress]);
-      await this.move(task.id, this.config.statusInReview);
+      await this.toPhase(task.id, 'pr_open', [], links.map((l) => l.url).join(' '));
       return 'implemented-pr';
     }
 
@@ -337,7 +632,7 @@ export class AutomationWatcher {
       'Verify:',
       ...verify
     ]);
-    await this.labels(task.id, [L.done], [L.inProgress]);
+    await this.toPhase(task.id, 'done', [], 'verified, no PR');
     return 'implemented-no-pr';
   }
 
