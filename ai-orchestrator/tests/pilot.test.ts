@@ -9,13 +9,12 @@ import { ServiceCatalog } from '../src/catalog/service-catalog.js';
 import { ImpactAnalysisAgent } from '../src/agents/impact-analysis/agent.js';
 import { JobStore, TicketLockedError } from '../src/jobs/job-store.js';
 import { checkTestIntegrity, countTestCases, isTestFile } from '../src/agents/team-agent/repo-agents/test-integrity.js';
-import { RepoAgentA, TeamAgent } from '../src/agents/team-agent/team-agent.js';
+import { RepoAgent, TeamAgent } from '../src/agents/team-agent/team-agent.js';
 import { TestingAgent } from '../src/agents/testing/agent.js';
 import { DeduplicationAgent } from '../src/agents/deduplication/agent.js';
 import { Orchestrator } from '../src/orchestrator/orchestrator.js';
 import { MockAIProvider } from '../src/providers/ai-provider.js';
 import { GitWorkspaceManager } from '../src/workspace/git-workspace.js';
-import { qaTickets } from '../src/qa-runner.js';
 import type { FileChange, TaskInput } from '../src/models/types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -35,6 +34,62 @@ const task = (id: string, title = 'Add feature', description = 'feature'): TaskI
   description,
   acceptanceCriteria: []
 });
+
+/** Sample tickets used to check that catalog routing matches the built-in rules. */
+const qaTickets: Record<string, TaskInput> = {
+  singleRepoPayment: {
+    id: 'PAY-101',
+    title: 'Add health endpoint',
+    description: 'Add GET /health endpoint to the payment service',
+    acceptanceCriteria: [
+      'GET /health returns HTTP 200',
+      'Response contains status UP'
+    ]
+  },
+  singleRepoOrder: {
+    id: 'ORD-201',
+    title: 'Add cancel order endpoint',
+    description: 'Add cancelOrder method to the order service in repo-b',
+    acceptanceCriteria: [
+      'Allows existing orders to transition to CANCELLED state',
+      'Returns updated order record'
+    ]
+  },
+  singleRepoNotification: {
+    id: 'NOTIF-301',
+    title: 'Add SMS delivery receipt channel',
+    description: 'Add notification delivery tracking in repo-c',
+    acceptanceCriteria: [
+      'Tracks sent notification timestamp and recipient',
+      'Verifies notification dispatch'
+    ]
+  },
+  parallelMultiRepo: {
+    id: 'CROSS-401',
+    title: 'Add shared telemetry headers across all services',
+    description: 'Add cross-service request tracing to repo-a, repo-b, and repo-c',
+    acceptanceCriteria: [
+      'Payment service supports X-Trace-ID',
+      'Order service forwards X-Trace-ID',
+      'Notification service records X-Trace-ID'
+    ]
+  },
+  dependentMultiRepo: {
+    id: 'DEP-501',
+    title: 'Add synchronized checkout payment flow',
+    description: 'Implement linked payment-order token handshake',
+    acceptanceCriteria: [
+      'Payment service charges invoice first',
+      'Order service confirms after payment succeeds'
+    ]
+  },
+  unroutable: {
+    id: 'UNR-601',
+    title: 'Show creators on the homepage',
+    description: 'Display three NFL content creators in the homepage right column',
+    acceptanceCriteria: ['Creators are visible on the homepage']
+  }
+};
 
 describe('Service catalog', () => {
   it('reproduces the built-in routing exactly for every QA ticket', async () => {
@@ -163,7 +218,7 @@ describe('Test integrity guard', () => {
         { path: 'tests/a.test.ts', action: 'delete' }
       ]
     }));
-    const result = await new RepoAgentA(provider, repo).execute(task('T-1'));
+    const result = await new RepoAgent('repo-a', repo, provider).execute(task('T-1'));
     expect(result.success).toBe(false);
     expect(result.error).toMatch(/Test integrity violation/);
     await expect(fs.access(path.join(repo, 'src', 'fix.ts'))).rejects.toThrow();
@@ -288,6 +343,62 @@ describe('Git branch + worktree per ticket', () => {
     expect(gitIn(repo, 'rev-list', '--count', 'main..ai/feat-2')).toBe('0'); // nothing committed
     expect(gitIn(repo, 'status', '--porcelain')).toBe(''); // main checkout untouched
     await expect(fs.access(path.join(result.branches![0].workdir, 'src', 'features', 'feat-2.ts'))).resolves.toBeUndefined();
+  });
+
+  it('a clone with origin: the ticket branch starts from the LATEST origin/<base>, untracked; commits never include node_modules or .env', async () => {
+    // "Bitbucket" = a bare repo; the developer's clone is behind it (someone merged after the clone).
+    const upstream = await makeGitRepo('upstream-src');
+    gitIn(upstream, 'branch', 'QA');
+    const remote = path.join(tmp, 'remote.git');
+    gitIn(tmp, 'clone', '-q', '--bare', upstream, remote);
+    const clone = path.join(tmp, 'dev-clone');
+    gitIn(tmp, 'clone', '-q', remote, clone);
+    gitIn(clone, 'config', 'user.email', 'orchestrator-test@example.com');
+    gitIn(clone, 'config', 'user.name', 'Orchestrator Test');
+    const other = path.join(tmp, 'other-clone');
+    gitIn(tmp, 'clone', '-q', '-b', 'QA', remote, other);
+    gitIn(other, 'config', 'user.email', 'o@example.com');
+    gitIn(other, 'config', 'user.name', 'Other Dev');
+    await fs.writeFile(path.join(other, 'src', 'later.ts'), 'export const later = 2;\n');
+    gitIn(other, 'add', '-A');
+    gitIn(other, 'commit', '-q', '-m', 'merged later on QA');
+    gitIn(other, 'push', '-q', 'origin', 'QA');
+    const latestQa = gitIn(other, 'rev-parse', 'HEAD');
+
+    const ws = await new GitWorkspaceManager({ worktreesDir: path.join(tmp, 'wt-origin') }).prepare(task('T2-9'), 'gb', clone, 'QA');
+    expect(ws.managedByGit).toBe(true);
+    expect(ws.baseRef).toBe('origin/QA');
+    expect(gitIn(ws.workdir, 'rev-parse', 'HEAD')).toBe(latestQa); // latest QA, not the stale clone
+    expect(() => gitIn(ws.workdir, 'rev-parse', '--abbrev-ref', '@{upstream}')).toThrow(); // no tracking of QA
+
+    await fs.writeFile(path.join(ws.workdir, 'src', 'fix.ts'), 'export const fix = 1;\n');
+    await fs.mkdir(path.join(ws.workdir, 'node_modules', 'pkg'), { recursive: true });
+    await fs.writeFile(path.join(ws.workdir, 'node_modules', 'pkg', 'index.js'), 'x');
+    await fs.writeFile(path.join(ws.workdir, '.env'), 'SECRET=1');
+    const sha = await new GitWorkspaceManager({ worktreesDir: path.join(tmp, 'wt-origin') }).commit(task('T2-9'), ws);
+    expect(sha).toBeTruthy();
+    expect(gitIn(ws.workdir, 'show', '--name-only', '--format=', 'HEAD').split('\n')).toEqual(['src/fix.ts']);
+    expect(gitIn(ws.workdir, 'log', '-1', '--format=%B')).toContain('Human review required before merge');
+
+    // Planning snapshot: the LATEST origin/QA (not the clone's checked-out main), removed afterwards.
+    const manager = new GitWorkspaceManager({ worktreesDir: path.join(tmp, 'wt-origin') });
+    const snap = await manager.snapshot(clone, 'QA', 'T2-9-gb');
+    expect(snap).toBeDefined();
+    expect(gitIn(snap!.dir, 'rev-parse', 'HEAD')).toBe(latestQa);
+    expect(gitIn(clone, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('main'); // the developer's checkout is untouched
+    await snap!.cleanup();
+    await expect(fs.access(snap!.dir)).rejects.toThrow();
+    expect(gitIn(clone, 'worktree', 'list')).not.toContain('_snapshots');
+    expect(await manager.snapshot(clone, undefined, 'x')).toBeUndefined(); // no base branch → plan on the checkout
+
+    // Retry after a failed run: uncommitted leftovers are discarded, the committed fix and node_modules stay.
+    await fs.writeFile(path.join(ws.workdir, 'src', 'fix.ts'), 'export const fix = "half-done";\n');
+    await fs.writeFile(path.join(ws.workdir, 'src', 'leftover.ts'), 'export const x = 1;\n');
+    const again = await manager.prepare(task('T2-9'), 'gb', clone, 'QA');
+    expect(again.workdir).toBe(ws.workdir);
+    expect(gitIn(again.workdir, 'status', '--porcelain')).toBe('?? node_modules/'); // only the (kept) install remains
+    expect(await fs.readFile(path.join(again.workdir, 'src', 'fix.ts'), 'utf-8')).toBe('export const fix = 1;\n');
+    await expect(fs.access(path.join(again.workdir, 'node_modules', 'pkg', 'index.js'))).resolves.toBeUndefined();
   });
 
   it('works in place (old behaviour) for folders that are not standalone git repos', async () => {

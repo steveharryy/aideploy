@@ -1,0 +1,60 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/steveharryy/aideploy/schemas/work-item.schema.json",
+  "title": "WorkItem",
+  "description": "Hand-off from the PLANNING agent to the CODING agent. One work item = one repo. Validate with: npm run code -- --validate <file>",
+  "type": "object",
+  "required": ["ticket", "workItemId", "repo", "title", "summary", "acceptanceCriteria", "testPlan"],
+  "additionalProperties": false,
+  "properties": {
+    "ticket": { "type": "string", "minLength": 1, "description": "Jira key, e.g. T2-547" },
+    "workItemId": { "type": "string", "minLength": 1, "description": "Id within the plan, e.g. W1" },
+    "repo": { "type": "string", "minLength": 1, "description": "Repo id from catalog/repos.yaml; the coding agent never switches repos" },
+    "title": { "type": "string", "minLength": 1 },
+    "summary": { "type": "string", "minLength": 1, "description": "What to build, one or two sentences" },
+    "acceptanceCriteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "text"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "pattern": "^[Aa][Cc]-?[0-9]+$", "description": "AC1, AC2, ... (unique)" },
+          "text": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "testPlan": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Tests the coding agent writes FIRST. Every AC needs at least one entry; names must contain the AC id.",
+      "items": {
+        "type": "object",
+        "required": ["ac", "name", "description"],
+        "additionalProperties": false,
+        "properties": {
+          "ac": { "type": "string", "description": "AC id this test covers" },
+          "name": { "type": "string", "minLength": 1, "description": "e.g. test_AC1_tied_ranks_split_evenly" },
+          "description": { "type": "string" }
+        }
+      }
+    },
+    "plannedFiles": {
+      "type": "array",
+      "description": "Expected scope. Edits outside these files need a reason from the coding agent.",
+      "items": {
+        "type": "object",
+        "required": ["path"],
+        "additionalProperties": false,
+        "properties": {
+          "path": { "type": "string", "minLength": 1, "description": "Repo-relative path (no leading / or ..)" },
+          "change": { "type": "string" }
+        }
+      }
+    },
+    "contract": { "type": "string", "description": "Shared contract with other repos (API shapes, message formats). Never changed by the coding agent." },
+    "assumptions": { "type": "array", "items": { "type": "string" } },
+    "clarifications": { "type": "array", "items": { "type": "string" }, "description": "Answers to earlier ask_user questions" }
+  }
+}

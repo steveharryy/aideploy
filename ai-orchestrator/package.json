@@ -7,12 +7,11 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "qa": "tsx src/qa-runner.ts",
-    "clean": "tsx src/clean-repos.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "watch": "tsx src/index.ts --watch"
+    "watch": "tsx src/index.ts --watch",
+    "code": "tsx src/code.ts"
   },
   "keywords": [
     "orchestrator",

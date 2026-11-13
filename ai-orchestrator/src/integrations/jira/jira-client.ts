@@ -215,7 +215,8 @@ export function commentAdf(lines: string[], preformatted?: string): AdfNode {
     const text = preformatted.length > 30000 ? `${preformatted.slice(0, 30000)}\n… (truncated)` : preformatted;
     content.push({ type: 'codeBlock', content: [{ type: 'text', text }] });
   }
-  return { type: 'doc', attrs: { version: 1 }, content } as AdfNode;
+  // ADF root: "version" is a top-level property (not inside attrs), or Jira answers 400 INVALID_INPUT.
+  return { type: 'doc', version: 1, content } as unknown as AdfNode;
 }
 
 /** Converts Atlassian Document Format (or a plain string) to readable text. */

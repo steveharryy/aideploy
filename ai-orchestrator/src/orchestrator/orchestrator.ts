@@ -185,6 +185,16 @@ export class Orchestrator {
       return fail('IMPACT_FAILED', `Impact Analysis failed: ${errorMessage}`, { deduplication });
     }
 
+    // The human-approved change plan defines the scope: only repos it plans file changes for are touched,
+    // even if keyword routing (re-run here) would match more.
+    const approvedPlans = task.metadata?.approvedPlans as Record<string, { filesToChange?: Array<{ path?: string }> }> | undefined;
+    if (approvedPlans && Object.keys(approvedPlans).length > 0) {
+      const approvedRepos = Object.keys(approvedPlans).filter((r) => (approvedPlans[r]?.filesToChange ?? []).some((f) => f?.path));
+      const leftOut = impact.affectedRepositories.filter((r) => !approvedRepos.includes(r));
+      if (leftOut.length) this.log('IMPACT ANALYSIS', `Not in the approved plan, left out: ${leftOut.join(', ')}`);
+      impact = { ...impact, affectedRepositories: approvedRepos, reasoning: `Scope of the approved change plan: ${approvedRepos.join(', ') || 'none'}.` };
+    }
+
     if (impact.affectedRepositories.length === 0) {
       this.log('IMPACT ANALYSIS', `No repository matched this task. ${impact.reasoning}`);
       this.log('RESULT', 'Stopped: no matching repository (needs triage)');

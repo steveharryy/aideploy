@@ -8,11 +8,11 @@ import type {
   TeamExecutionResult
 } from '../../models/types.js';
 import { BaseRepoAgent, type IRepoAgent } from './repo-agents/base-repo-agent.js';
-import { RepoAgentA } from './repo-agents/repo-agent-a/agent.js';
-import { RepoAgentB } from './repo-agents/repo-agent-b/agent.js';
-import { RepoAgentC } from './repo-agents/repo-agent-c/agent.js';
 
-export { BaseRepoAgent, type IRepoAgent, RepoAgentA, RepoAgentB, RepoAgentC };
+export { BaseRepoAgent, type IRepoAgent };
+
+/** The agent that works on ONE repository. Every repo gets one; its settings come from catalog/repos.yaml. */
+export class RepoAgent extends BaseRepoAgent {}
 
 export interface TeamAgentConfig {
   repositoriesRoot?: string;
@@ -34,28 +34,14 @@ export interface ITeamAgent {
 /**
  * Creates the appropriate Repo Agent instance based on repository identifier.
  */
-export function createDefaultRepoAgent(
-  repoId: string,
-  repoPath: string,
-  aiProvider: AIProvider
-): IRepoAgent {
-  switch (repoId.toLowerCase()) {
-    case 'repo-a':
-      return new RepoAgentA(aiProvider, repoPath);
-    case 'repo-b':
-      return new RepoAgentB(aiProvider, repoPath);
-    case 'repo-c':
-      return new RepoAgentC(aiProvider, repoPath);
-    default:
-      // Generic fallback for any additional repository
-      return new (class extends BaseRepoAgent { })(repoId, repoPath, aiProvider);
-  }
+export function createDefaultRepoAgent(repoId: string, repoPath: string, aiProvider: AIProvider): IRepoAgent {
+  return new RepoAgent(repoId, repoPath, aiProvider);
 }
 
 /**
  * TeamAgent
  *
- * Coordinates repository-specific sub-agents (RepoAgentA, RepoAgentB, RepoAgentC).
+ * Coordinates repository-specific sub-agents (one RepoAgent per repository).
  * Evaluates dependencies and executes independent repo agents concurrently via Promise.all
  * while maintaining sequential order for dependent repositories.
  */

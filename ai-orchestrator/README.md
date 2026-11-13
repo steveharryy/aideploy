@@ -73,12 +73,6 @@ ai-orchestrator/
 │   │       ├── team-agent.ts              # Multi-repo coordinator (parallel/sequential)
 │   │       └── repo-agents/
 │   │           ├── base-repo-agent.ts     # Reusable base logic for repo agents
-│   │           ├── repo-agent-a/
-│   │           │   └── agent.ts           # RepoAgentA (Payment Service)
-│   │           ├── repo-agent-b/
-│   │           │   └── agent.ts           # RepoAgentB (Order Service)
-│   │           └── repo-agent-c/
-│   │               └── agent.ts           # RepoAgentC (Notification Service)
 │   │
 │   ├── providers/
 │   │   └── ai-provider.ts                 # AIProvider interface and MockAIProvider
@@ -200,8 +194,6 @@ Failed: Task is duplicate
 | Command | Purpose |
 | :--- | :--- |
 | `npm start` | Runs the main CLI demo (Scenario 1 new task + Scenario 2 duplicate detection). |
-| `npm run qa` | Runs the automated QA suite across 6 sample tickets (single repo, parallel multi-repo, dependent sequential, deduplication). |
-| `npm run clean` | Revokes all generated code and resets repositories and `.task-history.json` to baseline. |
 | `npm test` | Runs the complete 12-test Vitest test suite. |
 | `npm run typecheck` | Runs TypeScript compiler checks (`tsc --noEmit`). |
 

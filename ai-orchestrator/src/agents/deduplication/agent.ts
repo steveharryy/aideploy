@@ -144,6 +144,9 @@ export class DeduplicationAgent implements IDeduplicationAgent {
         }
         const overlapRatio = matches / Math.max(taskWords.size, existingWords.length);
         if (overlapRatio >= 0.8) {
+          // Same rule as an exact title match: only a duplicate while that task's code is still in the
+          // repo (e.g. work done in an old copy of a repo is not "done" in its real clone).
+          if (!(await this.verifyImplementationPresent(task, existing))) continue;
           return {
             taskId: task.id,
             status: 'duplicate',

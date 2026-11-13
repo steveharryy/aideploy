@@ -70,19 +70,22 @@ export class ImpactAnalysisAgent implements IImpactAnalysisAgent {
     const affectedModules = new Set<string>();
     const affectedFiles = new Set<string>();
 
-    for (const rule of this.customRules) {
-      if (rule.keywords.some((kw) => matchesKeyword(searchableText, kw))) {
-        for (const repo of rule.repositories) {
-          affectedRepos.add(repo);
-        }
-        for (const mod of rule.modules) {
-          affectedModules.add(mod);
-        }
-        for (const file of rule.files || []) {
-          affectedFiles.add(file);
-        }
-      }
+    const matched = this.customRules
+      .map((rule) => ({ rule, hits: rule.keywords.filter((kw) => matchesKeyword(searchableText, kw)) }))
+      .filter((m) => m.hits.length > 0);
+    // Specific beats generic: when the ticket names code precisely (EventController, gb-homepage, repo-b),
+    // a repo reached only through an everyday word ("order" in "same order as the ids") is left out.
+    const anySpecific = matched.some((m) => m.hits.some(isSpecificKeyword));
+    const kept = anySpecific ? matched.filter((m) => m.hits.some(isSpecificKeyword)) : matched;
+
+    for (const { rule } of kept) {
+      for (const repo of rule.repositories) affectedRepos.add(repo);
+      for (const mod of rule.modules) affectedModules.add(mod);
+      for (const file of rule.files || []) affectedFiles.add(file);
     }
+    const leftOut = matched
+      .filter((m) => !kept.includes(m))
+      .flatMap((m) => m.rule.repositories.filter((r) => !affectedRepos.has(r)).map((r) => `${r} (only the generic word${m.hits.length > 1 ? 's' : ''} "${m.hits.join('", "')}")`));
 
     const repoList = Array.from(affectedRepos);
     const moduleList = Array.from(affectedModules);
@@ -106,9 +109,21 @@ export class ImpactAnalysisAgent implements IImpactAnalysisAgent {
       affectedModules: moduleList,
       affectedFiles: fileList,
       confidence: 0.95,
-      reasoning: `Rule-based analysis identified ${repoList.length} affected repository/repositories (${repoList.join(', ')}) based on task scope.`
+      reasoning:
+        `Rule-based analysis identified ${repoList.length} affected repository/repositories (${repoList.join(', ')}) based on task scope.` +
+        (leftOut.length ? ` Left out: ${[...new Set(leftOut)].join('; ')}, because the ticket names specific code elsewhere.` : '')
     };
   }
+}
+
+/**
+ * Identifier-like keywords name code precisely: CamelCase (EventController, getEventsV2), or with
+ * - _ . / digits (gb-homepage, repo-b), or multi-word phrases ("all services"). Plain words ("order",
+ * "payment") are generic and appear in ordinary sentences.
+ */
+export function isSpecificKeyword(keyword: string): boolean {
+  const kw = keyword.trim();
+  return /[A-Z]/.test(kw.slice(1)) || /[-_./\d\s]/.test(kw);
 }
 
 /**

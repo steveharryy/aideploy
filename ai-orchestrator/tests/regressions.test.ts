@@ -7,7 +7,7 @@ import { Orchestrator } from '../src/orchestrator/orchestrator.js';
 import { MockAIProvider } from '../src/providers/ai-provider.js';
 import { DeduplicationAgent } from '../src/agents/deduplication/agent.js';
 import { ImpactAnalysisAgent, matchesKeyword } from '../src/agents/impact-analysis/agent.js';
-import { TeamAgent, RepoAgentA } from '../src/agents/team-agent/team-agent.js';
+import { TeamAgent, RepoAgent } from '../src/agents/team-agent/team-agent.js';
 import { TestingAgent } from '../src/agents/testing/agent.js';
 import type { ImpactAnalysisResult, RepoExecutionResult, TaskInput } from '../src/models/types.js';
 
@@ -72,6 +72,61 @@ describe('Regression: impact analysis routing', () => {
     const t = task('RT-1', 'Homepage tweak', 'Change copy');
     t.metadata = { labels: ['repo-c'], components: [] };
     expect((await new ImpactAnalysisAgent().analyze(t)).affectedRepositories).toEqual(['repo-c']);
+  });
+
+  describe('specific beats generic (T2-590: "same order as the input ids" pulled in the Order Service)', () => {
+    const rules = [
+      { keywords: ['EventController', 'buildEventsV2Response', 'web-api'], repositories: ['web-api'], modules: ['homepage'] },
+      { keywords: ['order', 'cart', 'fulfillment', 'repo-b'], repositories: ['repo-b'], modules: ['order-service'] },
+      { keywords: ['payment', 'pay', 'charge', 'repo-a'], repositories: ['repo-a'], modules: ['payment-service'] }
+    ];
+    const agent = () => new ImpactAnalysisAgent({ repositoriesDir: root, customRules: rules });
+
+    it('a repo reached only by an everyday word is left out when the ticket names specific code', async () => {
+      const impact = await agent().analyze(
+        task('T2-590', 'EventController buildEventsV2Response: 60 sequential Redis calls (ai-ready)', 'Batch the reads', [
+          'For normal data the response is unchanged: same events, same order as the input ids'
+        ])
+      );
+      expect(impact.affectedRepositories).toEqual(['web-api']);
+      expect(impact.reasoning).toContain('Left out: repo-b (only the generic word "order")');
+    });
+
+    it('generic-only tickets still route to every matching repo', async () => {
+      const impact = await agent().analyze(task('X-9', 'Payment and order totals disagree', 'checkout charge vs order cart'));
+      expect(impact.affectedRepositories.sort()).toEqual(['repo-a', 'repo-b']);
+    });
+
+    it('a repo named specifically is kept next to another specific match', async () => {
+      const impact = await agent().analyze(task('X-10', 'EventController must also notify repo-b', 'x'));
+      expect(impact.affectedRepositories.sort()).toEqual(['repo-b', 'web-api']);
+    });
+  });
+
+  it('the approved change plan defines the scope at implementation time (not keyword routing)', async () => {
+    let coordinated: string[] = [];
+    const orchestrator = new Orchestrator({
+      aiProvider: new MockAIProvider(),
+      dedupAgent: new DeduplicationAgent({ repositoriesRoot: root }),
+      impactAgent: new ImpactAnalysisAgent({ repositoriesDir: root }), // routes "order" + "payment" text to repo-a and repo-b
+      teamAgent: {
+        coordinate: async (_t, impact) => {
+          coordinated = impact.affectedRepositories;
+          return { success: true, repoResults: [], executionPlan: [] };
+        }
+      },
+      testingAgent: { runTests: async () => ({ overallSuccess: true, summary: 'ok', repoResults: [] }) },
+      silent: true
+    });
+    const t = task('T2-591', 'Payment and order mismatch', 'pay order');
+    t.metadata = {
+      approvedPlans: {
+        'repo-a': { summary: 'fix', filesToChange: [{ path: 'src/server.ts', change: 'x' }] },
+        'repo-b': { summary: 'nothing here', filesToChange: [] } // planner found nothing → not in scope
+      }
+    };
+    await orchestrator.run(t);
+    expect(coordinated).toEqual(['repo-a']);
   });
 
   it('returns no repositories (no repo-a fallback) when nothing matches', async () => {
@@ -179,7 +234,7 @@ describe('Regression: repo agent file safety', () => {
         { path: badPath, action: 'create', content: 'x' }
       ]
     }));
-    return new RepoAgentA(provider, path.join(root, 'repo-a')).execute(task('S-1', 'x'));
+    return new RepoAgent('repo-a', path.join(root, 'repo-a'), provider).execute(task('S-1', 'x'));
   };
 
   it.each(['../repo-a-evil/pwn.txt', '../../escape.txt', '/etc/passwd-copy', '.git/hooks/pre-commit'])(
@@ -234,6 +289,26 @@ describe('Regression: duplicate check is read-only and recognises real code', ()
     const result = await dedup.check(task('T2-2', 'Gone'));
     expect(result.status).toBe('new'); // its file is missing, so re-running is allowed
     expect(await fs.readFile(historyFile, 'utf-8')).toBe(original); // ...but nothing was written
+  });
+
+  it('a similar title (≥80% overlap) is only a duplicate while that work is still in the repo', async () => {
+    const historyFile = path.join(tmpDir, 'history-overlap.json');
+    const title = 'SportsBull events shows live scores wrong events mapping';
+    // Done in an old copy of the repo: its test file does not exist in this repo (e.g. a fresh clone).
+    await fs.writeFile(
+      historyFile,
+      JSON.stringify([{ id: 'T2-587', title, description: 'x', status: 'COMPLETED', changedFiles: ['repo-b/src/index.ts', 'repo-b/tests/gone.test.ts'] }])
+    );
+    const dedup = new DeduplicationAgent({ historyFilePath: historyFile, repositoriesRoot: root });
+    expect((await dedup.check(task('T2-600', `${title} again`))).status).toBe('new');
+
+    // Same history, but the work IS in the repo → duplicate.
+    await fs.writeFile(
+      historyFile,
+      JSON.stringify([{ id: 'T2-587', title, description: 'x', status: 'COMPLETED', changedFiles: ['repo-b/src/index.ts'] }])
+    );
+    const dedup2 = new DeduplicationAgent({ historyFilePath: historyFile, repositoriesRoot: root });
+    expect((await dedup2.check(task('T2-600', `${title} again`))).status).toBe('duplicate');
   });
 });
 
