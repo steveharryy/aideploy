@@ -560,11 +560,23 @@ export class AutomationWatcher {
     }
 
     if (this.config.codingEnabled && !this.config.codingEnabled()) {
-      this.deps.log(`${task.id}: "${L.approved}" found but the coding phase is switched off → not started`);
+      // The approval itself is recorded (who, when, which plan version) so the plan is locked and
+      // the flow is complete; only the coding step waits. Re-adding the label once coding is on
+      // starts implementation from this approved plan.
+      this.deps.log(`${task.id}: approved, but the coding phase is switched off → approval recorded, not started`);
       if (this.config.dryRun) return 'skipped';
       await this.deps.jira.updateLabels(task.id, [], [L.approved]);
+      if (!plan.approvedAt) {
+        plan.approvedBy = (await this.deps.jira.getLabelAdder(task.id, L.approved).catch(() => undefined)) || 'unknown';
+        plan.approvedAt = new Date().toISOString();
+        this.savePlan(plan);
+      }
+      const v = plan.version ? ` v${plan.version}` : '';
+      await this.toPhase(task.id, 'approved', [], `plan${v} approved by ${plan.approvedBy}; coding switched off`);
       await this.comment(task.id, [
-        `"${L.approved}" received, but the coding phase is switched off for now. No branch, code or PR was created. The plan stays as it is.`
+        `Change plan${v} approved by ${plan.approvedBy} at ${plan.approvedAt}. The plan is now locked.`,
+        `The coding phase is switched off for now, so no branch, code or PR was created.`,
+        `When coding is switched on, add the label "${L.approved}" again to start implementation from this plan.`
       ]);
       return 'skipped';
     }

@@ -225,7 +225,7 @@ describe('coding phase switch', () => {
     let implemented = 0;
     const jobsDir = fs.mkdtempSync(path.join(tmp, 'coding-off-'));
     fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
-    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticket: 'T2-1', text: 'P', repos: [], plans: {} }));
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticketId: 'T2-1', version: 2, text: 'P', repos: [], plans: {} }));
     const w = new AutomationWatcher(
       { jql: 'x', labels: L, autoApprove: false, maxAttempts: 3, dryRun: false, codingEnabled: () => false },
       {
@@ -246,10 +246,16 @@ describe('coding phase switch', () => {
       }
     );
     const r = await w.runOnce();
+    expect(r.actions[0].detail ?? '').toBe('');
     expect(r.actions[0].action).toBe('skipped');
     expect(implemented).toBe(0);
     expect(removed).toContain(L.approved);
     expect(comments.join(' ')).toMatch(/coding phase is switched off/);
+    expect(comments.join(' ')).toMatch(/plan v2 approved by x/);
+    expect(w.sessions.get('T2-1')?.phase).toBe('approved');
+    const saved = JSON.parse(fs.readFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), 'utf-8'));
+    expect(saved.approvedBy).toBe('x');
+    expect(saved.approvedAt).toBeTruthy();
   });
 
   it('pipeline config: coding is off unless switched on', async () => {
