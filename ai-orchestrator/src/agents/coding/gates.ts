@@ -1,4 +1,4 @@
-import { exec, execFile } from 'node:child_process';
+import { exec, execFile, spawn } from 'node:child_process';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -33,6 +33,31 @@ export async function readTree(root: string, rel = ''): Promise<Tree> {
       if (!buf.includes(0)) tree.set(relPath, buf.toString('utf-8')); // skip binaries
     }
   }
+  return tree;
+}
+
+/**
+ * Paths the repo's own .gitignore ignores (build output, logs, ...), checked against the real
+ * checkout (the sandbox copy has no .git). Verify steps create these; they are never the agent's
+ * change. Not a git repo, or git missing → nothing is treated as ignored.
+ */
+export function gitIgnoredPaths(repoPath: string, paths: string[]): Promise<Set<string>> {
+  if (paths.length === 0) return Promise.resolve(new Set());
+  return new Promise((resolve) => {
+    let out = '';
+    const child = spawn('git', ['-C', repoPath, 'check-ignore', '--stdin', '-z'], { stdio: ['pipe', 'pipe', 'ignore'] });
+    child.stdout.on('data', (d) => (out += d));
+    child.on('error', () => resolve(new Set()));
+    // exit 0 = some ignored, 1 = none ignored, anything else = not a repo / error
+    child.on('close', (code) => resolve(code === 0 ? new Set(out.split('\0').filter(Boolean)) : new Set()));
+    child.stdin.end(paths.join('\0'));
+  });
+}
+
+/** readTree without the paths the repo's .gitignore ignores. */
+export async function readRepoTree(sandbox: string, repoPath: string): Promise<Tree> {
+  const tree = await readTree(sandbox);
+  for (const p of await gitIgnoredPaths(repoPath, [...tree.keys()])) tree.delete(p);
   return tree;
 }
 

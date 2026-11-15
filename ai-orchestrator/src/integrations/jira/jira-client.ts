@@ -374,15 +374,34 @@ export class JiraClient {
   }
 }
 
-/** Builds an ADF comment body: one paragraph per line, plus an optional code block. */
+/** Jira rejects comments over 32,767 characters (CONTENT_LIMIT_EXCEEDED). Stay well under it. */
+export const COMMENT_BUDGET = 24_000;
+const MAX_LINE = 1_000;
+const MAX_PRE = 8_000;
+
+/**
+ * Builds an ADF comment body: one paragraph per line, plus an optional code block.
+ * Capped so it always fits Jira's size limit: long lines and the code block are cut, and lines
+ * past the budget are replaced by one "N more lines not shown" line (a comment is never lost to size).
+ */
 export function commentAdf(lines: string[], preformatted?: string): AdfNode {
-  const content: AdfNode[] = lines
-    .filter((l) => l.trim().length > 0)
-    .map((l) => ({ type: 'paragraph', content: [{ type: 'text', text: l }] }));
+  const para = (text: string): AdfNode => ({ type: 'paragraph', content: [{ type: 'text', text }] });
+  const cut = (t: string, max: number) => (t.length > max ? `${t.slice(0, max)}… (truncated)` : t);
+  const kept = lines.filter((l) => l.trim().length > 0);
+  const content: AdfNode[] = [];
+  let used = 0;
+  for (let i = 0; i < kept.length; i++) {
+    const node = para(cut(kept[i], MAX_LINE));
+    const size = JSON.stringify(node).length;
+    if (used + size > COMMENT_BUDGET - MAX_PRE - 200) {
+      content.push(para(`… ${kept.length - i} more line(s) not shown (comment size limit). Full details are in the pipeline's job folder for this ticket.`));
+      break;
+    }
+    content.push(node);
+    used += size;
+  }
   if (preformatted && preformatted.trim()) {
-    // Jira limits comment size; keep the plan readable rather than failing the post.
-    const text = preformatted.length > 30000 ? `${preformatted.slice(0, 30000)}\n… (truncated)` : preformatted;
-    content.push({ type: 'codeBlock', content: [{ type: 'text', text }] });
+    content.push({ type: 'codeBlock', content: [{ type: 'text', text: cut(preformatted, MAX_PRE) }] });
   }
   // ADF: "version" is a top-level property of the doc node (not attrs); Jira rejects anything else.
   return { type: 'doc', version: 1, content } as unknown as AdfNode;

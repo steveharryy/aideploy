@@ -21,7 +21,7 @@ import {
   diffTrees,
   isAuxiliaryFile,
   outOfPlanFiles,
-  readTree,
+  readRepoTree,
   restoreFile,
   runCommand,
   scanDebugLeftovers,
@@ -315,27 +315,33 @@ export class CodingAgent {
      * config (never source); anything else is reverted; the whole verify contract must then pass.
      * Uses the shared fix-round budget; if it cannot get green, the agent stops as before.
      */
+    // What the agent changed = sandbox vs start, minus what the repo's .gitignore ignores (build/, logs/ ...).
+    const snapshot = () => readRepoTree(sandbox, input.repoPath);
+    // Test-integrity checks compare against the repo AFTER an approved baseline fix, so the fix itself
+    // (e.g. an it.todo in an empty suite) is not reported as the agent weakening tests.
+    let integrityBase: Tree | undefined;
     const repairBaseline = async (redLog: string) => {
       const fix = w.baselineFix!;
       const allowed = new Set(fix.files.filter(isBaselineFixFile));
-      const before: Tree = await readTree(sandbox);
+      const before: Tree = await snapshot();
       const reverted: string[] = [];
       let log = redLog;
       for (let attempt = 0; attempt < 2; attempt++) {
         spendIteration([`baseline fix: existing tests fail before any change (${fix.reason})`], 'baseline-fix');
         this.log(`[${w.repo}] phase 0: repairing the test baseline (approved in the plan: ${[...allowed].join(', ')})`);
         absorb(await callCoder(baselineFixPrompt(w, [...allowed], fix.reason, log, testStep!.run)));
-        for (const d of diffTrees(before, await readTree(sandbox))) {
+        for (const d of diffTrees(before, await snapshot())) {
           if (allowed.has(d.path)) continue;
           await restoreFile(sandbox, d.path, before.get(d.path));
           reverted.push(d.path);
           report.scope.revertedFiles.push(`${d.path} (not in the approved baseline fix)`);
         }
-        const changed = diffTrees(before, await readTree(sandbox)).map((d) => d.path);
+        const changed = diffTrees(before, await snapshot()).map((d) => d.path);
         if (changed.some((p) => isAuxiliaryFile(p))) for (const s of setupSteps) await run(s);
         const failure = (await runAll(baselineSteps())).find((r) => !r.passed);
         if (!failure) {
           report.baselineFix = { reason: fix.reason, files: changed, reverted };
+          integrityBase = await snapshot();
           this.log(`[${w.repo}] baseline is green after the approved fix (${changed.join(', ') || 'no file changes'})`);
           return;
         }
@@ -350,7 +356,7 @@ export class CodingAgent {
 
       // Sandbox copy: the real repo is never touched by the agent.
       await fs.cp(input.repoPath, sandbox, { recursive: true, verbatimSymlinks: true, filter: sandboxCopyFilter(input.repoPath) });
-      const original: Tree = await readTree(sandbox);
+      const original: Tree = await snapshot();
 
       // ── Baseline: the WHOLE verify contract must pass before any change. Then a red new test
       // proves something, and a later failure (e.g. a type error) is the change's fault, not
@@ -380,7 +386,7 @@ export class CodingAgent {
       absorb(reply);
       let lockedTests: Tree = new Map();
       for (let round = 0; ; round++) {
-        const now = await readTree(sandbox);
+        const now = await snapshot();
         const delta = diffTrees(original, now);
         const problems: string[] = [];
 
@@ -390,7 +396,7 @@ export class CodingAgent {
           report.scope.revertedFiles.push(`${c.path} (changed during tests-first phase)`);
         }
         const testChanges = delta.filter((d) => isTestFile(d.path));
-        const integrity = await checkTestIntegrity(toFileChanges(testChanges), async (p) => original.get(p));
+        const integrity = await checkTestIntegrity(toFileChanges(testChanges), async (p) => (integrityBase ?? original).get(p));
         problems.push(...integrity);
 
         const testFiles = testChanges.filter((d) => d.action !== 'delete').map((d) => ({ path: d.path, content: d.after ?? '' }));
@@ -435,13 +441,13 @@ export class CodingAgent {
         const failedCheck = report.checks.find((c) => !c.passed);
 
         // Point 7: deterministic scope self-check.
-        const delta = diffTrees(original, await readTree(sandbox));
+        const delta = diffTrees(original, await snapshot());
         report.scope.changedFiles = delta.map((d) => d.path);
         report.scope.secrets = scanSecrets(delta);
         report.scope.debugLeftovers = scanDebugLeftovers(delta);
         const outside = outOfPlanFiles(delta, w.plannedFiles);
         report.scope.outOfPlan = outside.map((p) => ({ path: p, reason: outOfPlanReasons[p] }));
-        const integrity = await checkTestIntegrity(toFileChanges(delta.filter((d) => isTestFile(d.path))), async (p) => original.get(p));
+        const integrity = await checkTestIntegrity(toFileChanges(delta.filter((d) => isTestFile(d.path))), async (p) => (integrityBase ?? original).get(p));
         const coverage = acCoverage(delta.filter((d) => isTestFile(d.path) && d.action !== 'delete').map((d) => ({ path: d.path, content: d.after ?? '' })), acIds);
 
         const problems: string[] = [];

@@ -390,3 +390,16 @@ describe('revision limit after an approval is withdrawn', () => {
     expect(planned).toBe(1);
   });
 });
+
+describe('Jira comment size', () => {
+  it('a huge comment is capped under Jira\'s limit with a "more lines" note (never CONTENT_LIMIT_EXCEEDED)', async () => {
+    const { commentAdf } = await import('../src/integrations/jira/jira-client.js');
+    const lines = Array.from({ length: 500 }, (_, i) => `- build/services/file${i}.js is outside the planned files. ${'x'.repeat(200)}`);
+    const doc = commentAdf(['Implementation stopped: FAILED.', ...lines], 'y'.repeat(50_000));
+    const json = JSON.stringify(doc);
+    expect(json.length).toBeLessThan(32_767);
+    expect(json).toContain('Implementation stopped: FAILED.');
+    expect(json).toMatch(/more line\(s\) not shown/);
+    expect(json).toContain('(truncated)');
+  });
+});

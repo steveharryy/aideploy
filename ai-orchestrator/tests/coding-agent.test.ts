@@ -313,13 +313,14 @@ describe('CodingAgent (points 4–9)', () => {
       if (cmd === 'npm test' && !cfg.includes('src/types')) return { code: 1, output: "TS2339: Property 'user' does not exist on type 'Request'", durationMs: 1, timedOut: false };
       return fakeExec(cwd, cmd, ...rest);
     };
-    const baselineFix = { files: ['tsconfig.test.json'], reason: 'jest cannot see src/types/index.d.ts' };
+    const baselineFix = { files: ['tsconfig.test.json', 'tests/existing.test.ts'], reason: 'jest cannot see src/types/index.d.ts' };
 
     it('only the listed config file may change; a source edit is reverted; then tests-first proceeds to ready_for_pr', async () => {
       const repo2 = brokenRepo();
       const { runner, calls } = fakeClaude({
         baseline: (cwd) => {
           fs.writeFileSync(path.join(cwd, 'tsconfig.test.json'), '{"include":["tests/**/*","src/types/**/*.d.ts"]}\n');
+          fs.appendFileSync(path.join(cwd, 'tests', 'existing.test.ts'), "it.todo('restore old tests');\n"); // approved in the fix
           fs.writeFileSync(path.join(cwd, 'src', 'other.ts'), 'export const other = 2; // sneaky\n');
           return done();
         }
@@ -327,9 +328,10 @@ describe('CodingAgent (points 4–9)', () => {
       const { report, changes } = await new CodingAgent({ runner, exec, bin: 'claude' }).run({ workItem: workItem({ baselineFix }), repoPath: repo2, verify: VERIFY });
       expect(report.status).toBe('ready_for_pr');
       expect(calls[0].phase).toBe('baseline');
-      expect(report.baselineFix).toEqual({ reason: baselineFix.reason, files: ['tsconfig.test.json'], reverted: ['src/other.ts'] });
-      expect(report.fixRounds[0].phase).toBe('baseline-fix');
-      expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts', 'tsconfig.test.json']);
+      expect(report.baselineFix).toEqual({ reason: baselineFix.reason, files: ['tests/existing.test.ts', 'tsconfig.test.json'], reverted: ['src/other.ts'] });
+      // Only the approved fix used a round: its it.todo is not reported as the agent weakening tests.
+      expect(report.fixRounds.map((f) => f.phase)).toEqual(['baseline-fix']);
+      expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts', 'tests/existing.test.ts', 'tsconfig.test.json']);
       expect(report.testsFirst).toMatchObject({ baselinePassed: true, failedBeforeChange: true });
     });
 
@@ -347,6 +349,28 @@ describe('CodingAgent (points 4–9)', () => {
       expect(validateWorkItem(workItem({ baselineFix: { files: ['src/controllers/x.ts'], reason: 'r' } })).join(' ')).toMatch(/not a test or test-runner config file/);
       expect(validateWorkItem(workItem({ baselineFix: { files: ['tsconfig.test.json', 'tests/a.test.ts'], reason: 'r' } }))).toEqual([]);
     });
+  });
+
+  it("build output and logs that the repo's .gitignore ignores are never treated as the agent's change", async () => {
+    const { execFileSync } = await import('node:child_process');
+    execFileSync('git', ['init', '-q'], { cwd: repo });
+    fs.writeFileSync(path.join(repo, '.gitignore'), 'build/\nlogs/\n');
+    // The verify steps write compiled output (with console.log and a token-looking string) and logs.
+    const exec: CommandRunner = async (cwd, cmd, ...rest) => {
+      if (cmd.startsWith('npx tsc')) {
+        fs.mkdirSync(path.join(cwd, 'build'), { recursive: true });
+        fs.writeFileSync(path.join(cwd, 'build', 'add.js'), `console.log('x'); const k = "${'eyJ' + 'hbGciOiJIUzI1NiJ9.e30.abcdefghijklmnop'}";\n`);
+        fs.mkdirSync(path.join(cwd, 'logs'), { recursive: true });
+        fs.writeFileSync(path.join(cwd, 'logs', '.audit.json'), '{}');
+      }
+      return fakeExec(cwd, cmd, ...rest);
+    };
+    const { runner } = fakeClaude({});
+    const { report, changes } = await new CodingAgent({ runner, exec, bin: 'claude' }).run({ workItem: workItem(), repoPath: repo, verify: VERIFY });
+    expect(report.status).toBe('ready_for_pr');
+    expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts']);
+    expect(report.scope.secrets).toEqual([]);
+    expect(report.scope.debugLeftovers).toEqual([]);
   });
 
   it('repo not green before the change (pre-existing type error) → escalated before any AI call, agent not blamed', async () => {
