@@ -40,7 +40,7 @@ ai-orchestrator/
 ## Tests
 
 ```bash
-npm test            # 205 tests, no network, no Jira, no Claude
+npm test            # 218 tests, no network, no Jira, no Claude
 npm run typecheck
 ```
 

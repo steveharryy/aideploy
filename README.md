@@ -144,7 +144,7 @@ Only two labels exist, and people set both:
 | Label | Meaning |
 |---|---|
 | `ai-ready` | Plan this ticket, or "I answered / updated it, plan again" |
-| `ai-approved` | I approve the posted plan, implement it |
+| `ai-approved` | I approve the posted plan, implement it (only when `coding.enabled: true`; otherwise the bot replies that coding is off) |
 
 The pipeline removes a label once it has acted on it. Everything else happens in comments:
 
@@ -201,7 +201,7 @@ Repos in the catalog today (all on `main`): gb-homepage-api, gb-payments-api, gb
 - Loop limits: 2 question rounds, 3 plan revisions, 2 retries for temporary AI failures (usage limit, timeout), then a person.
 
 **People**
-- Nothing is coded without `ai-approved`.
+- Nothing is coded without `ai-approved`, and nothing at all while `coding.enabled` is `false` in `config/pipeline.yaml` (the default).
 - The pipeline only comments, removes trigger labels and assigns too-vague tickets back to the reporter.
 
 **Coding phase**

@@ -29,6 +29,8 @@ export interface WatcherConfig {
   labels: WatcherLabels;
   /** Skip the human approval step (not recommended). */
   autoApprove: boolean;
+  /** Coding phase switch, read on every approval. Absent = on (tests, library use). */
+  codingEnabled?: () => boolean;
   /** Stop after this many implementation attempts per ticket. */
   maxAttempts: number;
   /**
@@ -555,6 +557,16 @@ export class AutomationWatcher {
       await this.deps.jira.updateLabels(task.id, [], [L.approved]);
       await this.comment(task.id, [`"${L.approved}" was added before a change plan existed. Drafting the plan first; approve it once you have reviewed it.`]);
       return this.handleReady(task);
+    }
+
+    if (this.config.codingEnabled && !this.config.codingEnabled()) {
+      this.deps.log(`${task.id}: "${L.approved}" found but the coding phase is switched off → not started`);
+      if (this.config.dryRun) return 'skipped';
+      await this.deps.jira.updateLabels(task.id, [], [L.approved]);
+      await this.comment(task.id, [
+        `"${L.approved}" received, but the coding phase is switched off for now. No branch, code or PR was created. The plan stays as it is.`
+      ]);
+      return 'skipped';
     }
 
     const attempts = this.deps.attempts(task.id);

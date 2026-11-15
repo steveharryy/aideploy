@@ -10,6 +10,8 @@ import { SESSION_PHASES, type SessionPhase } from '../jobs/session-store.js';
 
 export interface PipelineConfig {
   killSwitch: boolean;
+  /** Coding phase on/off. Off: "ai-approved" is acknowledged but no code is written. */
+  coding: { enabled: boolean };
   promptVersion: string;
   planning: {
     /** "tools": only the six planner tools (MCP); "readonly": built-in Read/Glob/Grep. */
@@ -49,6 +51,7 @@ export interface PipelineConfig {
 
 export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   killSwitch: false,
+  coding: { enabled: false },
   promptVersion: 'planning-v1',
   planning: {
     engine: 'tools',
@@ -118,6 +121,7 @@ export function parsePipelineConfig(raw: unknown): PipelineConfig {
   };
   return {
     killSwitch: bool(r.kill_switch, d.killSwitch, 'kill_switch'),
+    coding: { enabled: bool(obj(r.coding).enabled, d.coding.enabled, 'coding.enabled') },
     promptVersion: str(r.prompt_version, d.promptVersion, 'prompt_version') || d.promptVersion,
     planning: {
       engine: (() => {

@@ -190,3 +190,58 @@ describe('B5: tickets left mid-run are handed to a person', () => {
     expect(await w.sweepStale(Date.now())).toEqual([]); // nothing fresh is swept
   });
 });
+
+describe('Jira comment formatting', () => {
+  it('keeps the spaces around inline labels and code in rich comments', async () => {
+    const { missingInfoCommentAdf } = await import('../src/agents/planning/render-adf.js');
+    const adf = missingInfoCommentAdf({ ticket: 'T2-1', missingForReporter: [] } as unknown as Parameters<typeof missingInfoCommentAdf>[0], 'ai-ready');
+    const texts: string[] = [];
+    const walk = (n: { text?: string; content?: unknown[] }) => { if (n.text) texts.push(n.text); (n.content ?? []).forEach((c) => walk(c as typeof n)); };
+    walk(adf as never);
+    const line = texts.join('');
+    expect(line).toContain('Then add the label ai-ready again.');
+    expect(texts).toContain('ai-ready'); // the code-marked node itself has no stray spaces
+  });
+});
+
+describe('coding phase switch', () => {
+  it('ai-approved with coding switched off: label removed, comment posted, nothing implemented', async () => {
+    const comments: string[] = [];
+    const removed: string[] = [];
+    let implemented = 0;
+    const jobsDir = fs.mkdtempSync(path.join(tmp, 'coding-off-'));
+    fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticket: 'T2-1', text: 'P', repos: [], plans: {} }));
+    const w = new AutomationWatcher(
+      { jql: 'x', labels: L, autoApprove: false, maxAttempts: 3, dryRun: false, codingEnabled: () => false },
+      {
+        jira: {
+          searchTasks: async () => [ticket('T2-1', [L.approved])],
+          getTask: async () => ticket('T2-1', [L.approved]),
+          addComment: async (_k, lines) => void comments.push(lines.join(' ')),
+          updateLabels: async (_k, _a = [], r = []) => void removed.push(...r),
+          transition: async () => true,
+          getLabelAdder: async () => 'x'
+        },
+        jobsDir,
+        log: () => {},
+        attempts: () => 0,
+        plan: async () => { throw new Error('no'); },
+        implement: async () => { implemented++; throw new Error('must not run'); },
+        publish: async () => ({ links: [], skipped: [] })
+      }
+    );
+    const r = await w.runOnce();
+    expect(r.actions[0].action).toBe('skipped');
+    expect(implemented).toBe(0);
+    expect(removed).toContain(L.approved);
+    expect(comments.join(' ')).toMatch(/coding phase is switched off/);
+  });
+
+  it('pipeline config: coding is off unless switched on', async () => {
+    const { parsePipelineConfig, loadPipelineConfig } = await import('../src/config/pipeline-config.js');
+    expect(parsePipelineConfig({}).coding.enabled).toBe(false);
+    expect(parsePipelineConfig({ coding: { enabled: true } }).coding.enabled).toBe(true);
+    expect(loadPipelineConfig(path.join(__dirname, '..', 'config', 'pipeline.yaml')).coding.enabled).toBe(false);
+  });
+});

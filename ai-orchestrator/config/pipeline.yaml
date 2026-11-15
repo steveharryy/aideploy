@@ -5,6 +5,11 @@
 # Emergency override without editing the file: AI_KILL_SWITCH=true
 kill_switch: false
 
+# Coding phase. false: adding "ai-approved" only gets a Jira comment saying coding is off;
+# no branch, no code, no PR. Missing = false.
+coding:
+  enabled: false
+
 # System prompt file: prompts/<prompt_version>.md (versioned in Git; logged with every plan)
 prompt_version: planning-v2
 

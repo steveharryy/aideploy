@@ -765,6 +765,7 @@ function createWatcher(args: CliArgs, providerName: string) {
       jql,
       labels,
       autoApprove: process.env.AUTO_APPROVE_PLAN === 'true',
+      codingEnabled: () => pipelineConfig().coding.enabled,
       maxAttempts: Number(process.env.AUTOMATION_MAX_ATTEMPTS) || 3,
       maxQuestionRounds: Number(process.env.AUTOMATION_MAX_QUESTION_ROUNDS) || pipelineConfig().planning.maxQuestionRounds,
       maxPlanRevisions: pipelineConfig().planning.maxPlanRevisions,
