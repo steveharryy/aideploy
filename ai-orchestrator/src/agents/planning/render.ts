@@ -57,6 +57,7 @@ export function renderPlan(plan: TicketPlan): string {
     L.push(`      Task  : ${w.task}`);
     if (w.reason) L.push(`      Why   : ${w.reason}`);
     if (w.filesLikelyTouched.length) L.push(`      Files : ${w.filesLikelyTouched.join(', ')}`);
+    if (w.baselineFix) L.push(`      Step 0: fix the test baseline (${w.baselineFix.reason}); only ${w.baselineFix.files.join(', ')}`);
     w.approach.forEach((a, i) => L.push(`      ${i + 1}) ${a}`));
   }
 

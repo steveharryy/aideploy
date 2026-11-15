@@ -748,6 +748,11 @@ export function qualitySummary(r: CodingReport, markdown: boolean): string[] {
     ...notes,
     `${bold('Fix rounds:')} ${r.fixRounds.length === 0 ? 'none needed' : r.fixRounds.map((f) => `round ${f.round} (${f.phase}): ${f.problems[0] ?? ''}`.slice(0, 200)).join(' | ')}`
   ];
+  if (r.baselineFix) {
+    lines.push(
+      `${bold('Step 0, test baseline fix (approved in the plan):')} ${r.baselineFix.reason}. Changed: ${r.baselineFix.files.map(code).join(', ') || 'nothing'}${r.baselineFix.reverted.length ? `; reverted (not allowed): ${r.baselineFix.reverted.map(code).join(', ')}` : ''}`
+    );
+  }
   if (r.scope.revertedFiles.length) lines.push(`${bold('Reverted by the pipeline:')} ${r.scope.revertedFiles.join('; ')}`);
   if (r.assumptionsMade.length) lines.push(`${bold('Assumptions the agent made:')}`, ...r.assumptionsMade.slice(0, 5).map((a) => `- ${a}`));
   return lines;

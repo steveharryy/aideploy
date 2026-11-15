@@ -6,7 +6,7 @@ import { promisify } from 'node:util';
 import type { FileChange } from '../../models/types.js';
 import { IGNORED_DIRS, IGNORED_FILES } from '../../providers/claude-code-provider.js';
 import { isTestFile } from '../team-agent/repo-agents/test-integrity.js';
-import { normaliseAcId } from './work-item.js';
+import { isTestRunnerConfig, normaliseAcId } from './work-item.js';
 
 /**
  * Deterministic gates used by the coding agent. Nothing here calls an AI:
@@ -155,7 +155,7 @@ export function scanDebugLeftovers(changes: TreeChange[]): string[] {
 
 /** Supporting files that may change with tests (test runner setup), not counted as scope creep. */
 export function isAuxiliaryFile(p: string): boolean {
-  return /(^|\/)(package\.json|tsconfig[^/]*\.json|vitest\.config\.[cm]?[jt]s|jest\.config\.[cm]?[jt]s|pytest\.ini|setup\.cfg|pyproject\.toml)$/.test(p);
+  return isTestRunnerConfig(p);
 }
 
 /** Changed source files that the plan did not list (each needs a reason). */

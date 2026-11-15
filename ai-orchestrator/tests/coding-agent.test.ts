@@ -68,9 +68,9 @@ const fakeExec: CommandRunner = async (cwd, command) => {
   return { code: 0, output: '', durationMs: 1, timedOut: false };
 };
 
-type Phase = 'tests' | 'implement' | 'fix' | 'review';
+type Phase = 'baseline' | 'tests' | 'implement' | 'fix' | 'review';
 const phaseOf = (prompt: string): Phase =>
-  prompt.includes('REVIEWER agent') ? 'review' : prompt.includes('Phase: WRITE TESTS FIRST') ? 'tests' : prompt.includes('Phase: IMPLEMENT') ? 'implement' : 'fix';
+  prompt.includes('REVIEWER agent') ? 'review' : prompt.includes('Phase: BASELINE FIX') ? 'baseline' : prompt.includes('Phase: WRITE TESTS FIRST') ? 'tests' : prompt.includes('Phase: IMPLEMENT') ? 'implement' : 'fix';
 
 const done = (extra: Record<string, unknown> = {}) =>
   JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's', result: JSON.stringify({ status: 'done', summary: 'ok', ...extra }) });
@@ -80,10 +80,11 @@ const approve = (extra: Record<string, unknown> = {}) =>
 /** Builds a fake Claude whose behaviour per phase can be overridden; records every call. */
 function fakeClaude(handlers: Partial<Record<Phase, (cwd: string, n: number) => string | Promise<string>>>) {
   const calls: Array<{ phase: Phase; args: string[]; prompt: string; cwd: string }> = [];
-  const counts: Record<Phase, number> = { tests: 0, implement: 0, fix: 0, review: 0 };
+  const counts: Record<Phase, number> = { baseline: 0, tests: 0, implement: 0, fix: 0, review: 0 };
   const defaults: Record<Phase, (cwd: string, n: number) => string> = {
     tests: (cwd) => (fs.writeFileSync(path.join(cwd, 'tests', 'add.test.ts'), GOOD_TESTS), done()),
     implement: (cwd) => (fs.writeFileSync(path.join(cwd, 'src', 'add.ts'), FIXED), done({ summary: 'fixed add' })),
+    baseline: () => done(),
     fix: () => done(),
     review: () => approve()
   };
@@ -300,6 +301,54 @@ describe('CodingAgent (points 4–9)', () => {
     expect(calls).toHaveLength(0);
   });
 
+  describe('approved baseline fix (tests already broken on the base branch)', () => {
+    // Existing suite fails to compile until tsconfig.test.json includes the type augmentation.
+    const brokenRepo = () => {
+      const dir = makeRepo();
+      fs.writeFileSync(path.join(dir, 'tsconfig.test.json'), '{"include":["tests/**/*"]}\n');
+      return dir;
+    };
+    const exec: CommandRunner = async (cwd, cmd, ...rest) => {
+      const cfg = fs.readFileSync(path.join(cwd, 'tsconfig.test.json'), 'utf-8');
+      if (cmd === 'npm test' && !cfg.includes('src/types')) return { code: 1, output: "TS2339: Property 'user' does not exist on type 'Request'", durationMs: 1, timedOut: false };
+      return fakeExec(cwd, cmd, ...rest);
+    };
+    const baselineFix = { files: ['tsconfig.test.json'], reason: 'jest cannot see src/types/index.d.ts' };
+
+    it('only the listed config file may change; a source edit is reverted; then tests-first proceeds to ready_for_pr', async () => {
+      const repo2 = brokenRepo();
+      const { runner, calls } = fakeClaude({
+        baseline: (cwd) => {
+          fs.writeFileSync(path.join(cwd, 'tsconfig.test.json'), '{"include":["tests/**/*","src/types/**/*.d.ts"]}\n');
+          fs.writeFileSync(path.join(cwd, 'src', 'other.ts'), 'export const other = 2; // sneaky\n');
+          return done();
+        }
+      });
+      const { report, changes } = await new CodingAgent({ runner, exec, bin: 'claude' }).run({ workItem: workItem({ baselineFix }), repoPath: repo2, verify: VERIFY });
+      expect(report.status).toBe('ready_for_pr');
+      expect(calls[0].phase).toBe('baseline');
+      expect(report.baselineFix).toEqual({ reason: baselineFix.reason, files: ['tsconfig.test.json'], reverted: ['src/other.ts'] });
+      expect(report.fixRounds[0].phase).toBe('baseline-fix');
+      expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts', 'tsconfig.test.json']);
+      expect(report.testsFirst).toMatchObject({ baselinePassed: true, failedBeforeChange: true });
+    });
+
+    it('a fix that does not make the baseline green → escalated after 2 tries, nothing applied', async () => {
+      const { runner, calls } = fakeClaude({ baseline: () => done() });
+      const { report, changes } = await new CodingAgent({ runner, exec, bin: 'claude' }).run({ workItem: workItem({ baselineFix }), repoPath: brokenRepo(), verify: VERIFY });
+      expect(report.status).toBe('escalated');
+      expect(report.summary).toMatch(/approved baseline fix did not make the existing tests pass/);
+      expect(calls.filter((c) => c.phase === 'baseline')).toHaveLength(2);
+      expect(calls.some((c) => c.phase === 'tests')).toBe(false);
+      expect(changes).toEqual([]);
+    });
+
+    it('a baseline fix may never list application source', () => {
+      expect(validateWorkItem(workItem({ baselineFix: { files: ['src/controllers/x.ts'], reason: 'r' } })).join(' ')).toMatch(/not a test or test-runner config file/);
+      expect(validateWorkItem(workItem({ baselineFix: { files: ['tsconfig.test.json', 'tests/a.test.ts'], reason: 'r' } }))).toEqual([]);
+    });
+  });
+
   it('repo not green before the change (pre-existing type error) → escalated before any AI call, agent not blamed', async () => {
     const exec: CommandRunner = async (cwd, cmd) =>
       cmd.startsWith('npx tsc') ? { code: 2, output: 'tests/old.test.ts(27,3): error TS7031: implicit any', durationMs: 1, timedOut: false } : fakeExec(cwd, cmd, 1, {});
@@ -446,7 +495,7 @@ describe('Work item contract files (shared with the planning agent)', () => {
 
   it('JSON Schema and validator agree on required fields and properties', () => {
     expect(schema.required.sort()).toEqual(['acceptanceCriteria', 'repo', 'summary', 'testPlan', 'ticket', 'title', 'workItemId']);
-    const typed: Array<keyof WorkItem> = ['ticket', 'workItemId', 'repo', 'title', 'summary', 'acceptanceCriteria', 'testPlan', 'plannedFiles', 'contract', 'assumptions', 'clarifications'];
+    const typed: Array<keyof WorkItem> = ['ticket', 'workItemId', 'repo', 'title', 'summary', 'acceptanceCriteria', 'testPlan', 'plannedFiles', 'contract', 'assumptions', 'clarifications', 'baselineFix'];
     expect(Object.keys(schema.properties).sort()).toEqual([...typed].sort());
     // Every schema-required field is enforced by the validator too.
     for (const field of schema.required) {

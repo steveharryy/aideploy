@@ -10,7 +10,7 @@ ai-orchestrator/
 │   ├── pipeline.yaml          limits, kill switch, intake rules, Jira fields, prompt version
 │   └── components.yaml        Jira component or label → repos, product, risk floor
 ├── catalog/repos.yaml         repos the pipeline may touch (path, base branch, verify commands)
-├── prompts/planning-v2.md     planning agent instructions (versioned; v1 kept for history)
+├── prompts/planning-v3.md     planning agent instructions (versioned; v1, v2 kept for history)
 ├── src/
 │   ├── index.ts               CLI: --plan, --watch, --webhook, --sessions, --status; wiring
 │   ├── automation/
@@ -65,4 +65,4 @@ When a plan is approved and `coding.enabled` is `true` in `config/pipeline.yaml`
 
 ## Changing the planning prompt
 
-Add `prompts/planning-v3.md`, set `prompt_version: planning-v3` in `config/pipeline.yaml`, and run the same set of test tickets with `npm start -- --plan <key>` before and after. Every plan records the prompt version it was made with.
+Add `prompts/planning-v4.md`, set `prompt_version: planning-v4` in `config/pipeline.yaml`, and run the same set of test tickets with `npm start -- --plan <key>` before and after. Every plan records the prompt version it was made with.

@@ -21,6 +21,7 @@ Example: [`examples/work-item.example.json`](../examples/work-item.example.json)
 | `plannedFiles[]` | no | expected scope; edits outside need a reason |
 | `contract` | no | shared API/message contract; never changed by the coding agent |
 | `assumptions[]`, `clarifications[]` | no | clarifications = answers to earlier questions (re-runs) |
+| `baselineFix` | no | `{ files, reason }`: approved repair of tests already failing on the base branch; tests / test-runner config only |
 
 ```bash
 npm run code -- --validate my-work-item.json      # check a planning-agent output against the contract
@@ -45,6 +46,7 @@ npm run code -- --validate my-work-item.json      # check a planning-agent outpu
 | **8 Ask when stuck** | Returns `blocked` + questions instead of guessing | At most **3** questions, prefixed `[repo]` → status `needs_input`, nothing applied |
 | **9 Reviewer** | **Separate agent, fresh context, read-only**; sees the work item + diff + check results (never the coder's reasoning) | `blocker`/`major` findings or an AC judged not met → fix round; `minor` doesn't block |
 
+- **Broken baseline, approved repair (phase 0):** if the repo's existing tests already fail on the base branch, the agent stops, unless the approved plan's work item has `baselineFix: { files, reason }`. Then it first repairs the baseline, touching **only** those files, which must be test files or test-runner config (tsconfig, jest/vitest config, package.json; never source; the validator rejects anything else). Any other edit is reverted. The full verify contract must then pass, within 2 tries from the shared budget; otherwise → `escalated`. The fix is recorded in the report (`baselineFix`), the Jira comment and the PR description.
 - **One iteration budget** for all fix rounds (default **3**, `CODING_MAX_ITERATIONS`). When it runs out → `failed` with the open issues. There is no endless loop.
 - **One continuous coder session** (`--session-id` then `--resume`), so the agent keeps context from tests to implementation to fixes.
 - **Tools:** read/edit/search plus Bash limited to the repo's verify commands; no web; no MCP connectors; no secrets in its environment.

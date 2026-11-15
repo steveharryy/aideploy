@@ -1,5 +1,5 @@
 import type { WorkItem as CodingWorkItem } from '../coding/work-item.js';
-import { normaliseAcId } from '../coding/work-item.js';
+import { isBaselineFixFile, normaliseAcId } from '../coding/work-item.js';
 import type { TaskInput } from '../../models/types.js';
 import { CHECKLIST_ITEMS, CHECKLIST_LABELS, ESSENTIAL_ITEMS } from './types.js';
 import type {
@@ -236,7 +236,12 @@ export function normalizePlan(raw: unknown, ticketId: string): TicketPlan {
     confidence: oneOf<Confidence>(w.confidence, CONFIDENCE, 'low'),
     dependsOn: strList(pick(w, 'dependsOn', 'depends_on')),
     filesLikelyTouched: strList(pick(w, 'filesLikelyTouched', 'files_likely_touched')),
-    approach: strList(w.approach)
+    approach: strList(w.approach),
+    ...(() => {
+      const b = pick(w, 'baselineFix', 'baseline_fix') as Record<string, unknown> | undefined;
+      const files = b && typeof b === 'object' ? strList(b.files) : [];
+      return files.length ? { baselineFix: { files, reason: str(b!.reason) } } : {};
+    })()
   }));
 
   const firstWorkItem = workItems[0]?.id ?? '';
@@ -346,6 +351,11 @@ export function validatePlan(plan: TicketPlan, knownRepos: string[], options: { 
   if (plan.acceptanceCriteria.length === 0) problems.push('Plan is "ready" but has no acceptance criteria.');
 
   for (const w of plan.workItems) {
+    if (w.baselineFix) {
+      const bad = w.baselineFix.files.filter((f) => !isBaselineFixFile(f));
+      if (bad.length) problems.push(`${w.id} baseline fix may only touch test files or test-runner config, not ${bad.join(', ')}.`);
+      if (!w.baselineFix.reason) problems.push(`${w.id} baseline fix has no reason.`);
+    }
     if (ids.has(w.id)) problems.push(`Duplicate work item id ${w.id}.`);
     ids.add(w.id);
     if (!w.repo) problems.push(`${w.id} has no repo.`);
@@ -527,7 +537,8 @@ export function workItemsForCoding(plan: TicketPlan, title: string): CodingWorkI
           ...others.map((ac) => `${ac.id} is verified outside the code (${ac.verify}): ${ac.text}`),
           ...(item.dependsOn.length ? [`Depends on work items: ${item.dependsOn.join(', ')}`] : [])
         ],
-        clarifications: plan.clarifications
+        clarifications: plan.clarifications,
+        ...(item.baselineFix ? { baselineFix: item.baselineFix } : {})
       }
     ];
   });

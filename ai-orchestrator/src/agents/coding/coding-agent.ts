@@ -33,7 +33,7 @@ import {
   type Tree,
   type TreeChange
 } from './gates.js';
-import { normaliseAcId, validateWorkItem, type WorkItem } from './work-item.js';
+import { isBaselineFixFile, normaliseAcId, validateWorkItem, type WorkItem } from './work-item.js';
 
 export interface CodingAgentConfig {
   runner?: ClaudeCodeRunner;
@@ -81,6 +81,8 @@ export interface CodingReport {
   summary: string;
   acceptanceCriteria: Array<{ id: string; text: string; status: 'met' | 'not_met' | 'unverified'; evidence: string[] }>;
   testsFirst: { baselinePassed: boolean; files: string[]; failedBeforeChange: boolean };
+  /** Set when the approved plan's baseline fix was applied: why, and which files changed for it. */
+  baselineFix?: { reason: string; files: string[]; reverted: string[] };
   checks: Array<{ name: string; passed: boolean; durationMs: number; log?: string }>;
   scope: {
     changedFiles: string[];
@@ -93,7 +95,7 @@ export interface CodingReport {
   iterationsUsed: number;
   maxIterations: number;
   /** Why each fix round was spent (audit trail). */
-  fixRounds: Array<{ round: number; phase: 'tests-first' | 'checks-and-scope' | 'review'; problems: string[] }>;
+  fixRounds: Array<{ round: number; phase: 'baseline-fix' | 'tests-first' | 'checks-and-scope' | 'review'; problems: string[] }>;
   questions: string[];
   assumptionsMade: string[];
   openIssues: string[];
@@ -307,6 +309,42 @@ export class CodingAgent {
       this.log(`[${w.repo}] fix round ${report.iterationsUsed}/${this.maxIterations}: ${why.length} problem(s)`);
     };
 
+    /**
+     * Phase 0 (only when the APPROVED plan includes a baseline fix): repair tests that already fail on
+     * the base branch. Guards: only the plan's listed files may change, and only tests or test-runner
+     * config (never source); anything else is reverted; the whole verify contract must then pass.
+     * Uses the shared fix-round budget; if it cannot get green, the agent stops as before.
+     */
+    const repairBaseline = async (redLog: string) => {
+      const fix = w.baselineFix!;
+      const allowed = new Set(fix.files.filter(isBaselineFixFile));
+      const before: Tree = await readTree(sandbox);
+      const reverted: string[] = [];
+      let log = redLog;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        spendIteration([`baseline fix: existing tests fail before any change (${fix.reason})`], 'baseline-fix');
+        this.log(`[${w.repo}] phase 0: repairing the test baseline (approved in the plan: ${[...allowed].join(', ')})`);
+        absorb(await callCoder(baselineFixPrompt(w, [...allowed], fix.reason, log, testStep!.run)));
+        for (const d of diffTrees(before, await readTree(sandbox))) {
+          if (allowed.has(d.path)) continue;
+          await restoreFile(sandbox, d.path, before.get(d.path));
+          reverted.push(d.path);
+          report.scope.revertedFiles.push(`${d.path} (not in the approved baseline fix)`);
+        }
+        const changed = diffTrees(before, await readTree(sandbox)).map((d) => d.path);
+        if (changed.some((p) => isAuxiliaryFile(p))) for (const s of setupSteps) await run(s);
+        const failure = (await runAll(baselineSteps())).find((r) => !r.passed);
+        if (!failure) {
+          report.baselineFix = { reason: fix.reason, files: changed, reverted };
+          this.log(`[${w.repo}] baseline is green after the approved fix (${changed.join(', ') || 'no file changes'})`);
+          return;
+        }
+        log = failure.log ?? '';
+      }
+      throw new Stop('escalated', `The approved baseline fix did not make the existing tests pass (only ${[...allowed].join(', ')} may change):\n${log}`);
+    };
+    const baselineSteps = () => (input.verify.includes(testStep!) ? input.verify : [...input.verify, testStep!]);
+
     try {
       if (!testStep) throw new Stop('escalated', `Repo "${w.repo}" has no test command in its verify contract (catalog/repos.yaml), so tests-first cannot be enforced.`);
 
@@ -317,19 +355,22 @@ export class CodingAgent {
       // ── Baseline: the WHOLE verify contract must pass before any change. Then a red new test
       // proves something, and a later failure (e.g. a type error) is the change's fault, not
       // a pre-existing problem the agent would burn its fix rounds on. ──
-      const baselineSteps = input.verify.includes(testStep) ? input.verify : [...input.verify, testStep];
-      this.log(`[${w.repo}] baseline: ${baselineSteps.map((s) => s.name).join(' → ')}`);
-      const baselineFailure = (await runAll(baselineSteps)).find((c) => !c.passed);
+      this.log(`[${w.repo}] baseline: ${baselineSteps().map((s) => s.name).join(' → ')}`);
+      const baselineFailure = (await runAll(baselineSteps())).find((c) => !c.passed);
       if (baselineFailure) {
         const log = baselineFailure.log ?? '';
         if (setupSteps.some((s) => s.name === baselineFailure.name)) throw new Stop('failed', `Setup step "${baselineFailure.name}" failed before any change:\n${log}`);
         if (baselineFailure.name === testStep.name) {
-          throw new Stop('escalated', `Existing tests already fail before any change, so a failing new test proves nothing:\n${log}`);
-        }
+          if (!w.baselineFix) {
+            throw new Stop('escalated', `Existing tests already fail before any change, so a failing new test proves nothing:\n${log}`);
+          }
+          await repairBaseline(log);
+        } else {
         throw new Stop(
           'escalated',
           `The repo is not green before any change: verify step "${baselineFailure.name}" already fails. Fix the repo (or its verify contract in catalog/repos.yaml) first; otherwise the agent would be blamed for it:\n${log}`
         );
+        }
       }
       report.testsFirst.baselinePassed = true;
 
@@ -473,6 +514,23 @@ export class CodingAgent {
 }
 
 // ── Prompts ─────────────────────────────────────────────────────────────────
+
+function baselineFixPrompt(w: WorkItem, files: string[], reason: string, redLog: string, testCommand: string): string {
+  return `${workItemBlock(w)}
+
+Phase: BASELINE FIX (approved in the plan). The repo's EXISTING tests already fail on the base branch, before any feature work.
+Why (from the approved plan): ${reason}
+You may change ONLY these files: ${files.join(', ')}. Any other change is reverted automatically. Do not touch application source, do not delete or skip tests, do not weaken assertions.
+Make \`${testCommand}\` and the other verify steps pass on the CURRENT code. Do not start the feature yet.
+
+Current failure:
+${redLog}
+
+Run: ${testCommand}  and confirm it passes. Reply with status "done" when it passes, "escalate" if it cannot be fixed within these files.
+
+Reply with ONLY this JSON:
+${REPLY_SHAPE}`;
+}
 
 function workItemBlock(w: WorkItem): string {
   return `<work_item>\n${JSON.stringify(w, null, 2)}\n</work_item>`;

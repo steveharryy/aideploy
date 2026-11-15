@@ -124,8 +124,16 @@ export function planCommentAdf(plan: TicketPlan, meta: PlanCommentMeta): AdfNode
       ])
     )
   );
-  for (const w of plan.workItems.filter((x) => x.approach.length || x.filesLikelyTouched.length)) {
+  for (const w of plan.workItems.filter((x) => x.approach.length || x.filesLikelyTouched.length || x.baselineFix)) {
     C.push(para(strong(`${w.id} · ${w.repo}`)));
+    if (w.baselineFix) {
+      C.push(
+        panel(
+          'warning',
+          para(strong('Step 0, test baseline fix: '), text(`${w.baselineFix.reason} Only these files may change for it: `), ...w.baselineFix.files.flatMap((f, i) => [...(i ? [text(', ')] : []), code(f)]))
+        )
+      );
+    }
     if (w.filesLikelyTouched.length) C.push(para(text('Files: '), ...w.filesLikelyTouched.flatMap((f, i) => [...(i ? [text(', ')] : []), code(f)])));
     if (w.approach.length) C.push(numbered(w.approach.map((a) => withCode(a))));
   }

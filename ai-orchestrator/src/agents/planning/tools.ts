@@ -180,7 +180,13 @@ export const TOOL_DEFINITIONS = [
                   confidence: { type: 'string', enum: ['high', 'medium', 'low'] },
                   depends_on: { type: 'array', items: { type: 'string' } },
                   files_likely_touched: { type: 'array', items: { type: 'string' } },
-                  approach: { type: 'array', items: { type: 'string' } }
+                  approach: { type: 'array', items: { type: 'string' } },
+                  baseline_fix: {
+                    type: 'object',
+                    description: "Only if the repo's EXISTING tests already fail on the base branch: the minimal repair (test files or test-runner config only, never source).",
+                    properties: { files: { type: 'array', items: { type: 'string' } }, reason: { type: 'string' } },
+                    required: ['files', 'reason']
+                  }
                 },
                 required: ['id', 'repo', 'task', 'reason', 'confidence']
               }

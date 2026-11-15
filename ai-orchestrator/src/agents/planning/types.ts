@@ -94,6 +94,12 @@ export interface WorkItem {
   filesLikelyTouched: string[];
   /** Ordered implementation steps. */
   approach: string[];
+  /**
+   * The repo's EXISTING tests already fail on the base branch: the minimal repair, done first.
+   * Only tests and test-runner config (never source). Shown to the approver; the coding agent
+   * may only touch these files for it.
+   */
+  baselineFix?: { files: string[]; reason: string };
 }
 
 export interface PlanAcceptanceCriterion {

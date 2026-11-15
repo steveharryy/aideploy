@@ -11,7 +11,7 @@ coding:
   enabled: false
 
 # System prompt file: prompts/<prompt_version>.md (versioned in Git; logged with every plan)
-prompt_version: planning-v2
+prompt_version: planning-v3
 
 planning:
   # tools:    the agent can only use the planner tools (jira_read, list_repos, search_code,

@@ -334,3 +334,23 @@ describe('planning → coding hand-off', () => {
     expect(w.clarifications).toEqual(['Q1: A (product)']);
   });
 });
+
+describe('planned baseline fix (planning side)', () => {
+  it('parses baseline_fix, rejects source files, passes it to the coding work item', async () => {
+    const { normalizePlan, validatePlan, workItemsForCoding } = await import('../src/agents/planning/plan-rules.js');
+    const raw = {
+      summary: 's', readiness: 'ready', risk: 'medium', riskReason: 'r',
+      workItems: [{ id: 'W1', repo: 'api', task: 't', reason: 'r', confidence: 'high', files_likely_touched: ['src/a.ts'], approach: ['x'],
+        baseline_fix: { files: ['tsconfig.test.json'], reason: 'jest cannot see src/types' } }],
+      acceptanceCriteria: [{ id: 'AC1', text: 'a', verify: 'unit_test', workItem: 'W1', source: 'ticket' }],
+      testPlan: [{ ac: 'AC1', workItem: 'W1', name: 'test_AC1_a', cases: ['x'] }]
+    };
+    const plan = normalizePlan(raw, 'T2-1');
+    expect(plan.workItems[0].baselineFix).toEqual({ files: ['tsconfig.test.json'], reason: 'jest cannot see src/types' });
+    expect(validatePlan(plan, ['api']).join(' ')).not.toMatch(/baseline fix/);
+    expect(workItemsForCoding(plan, 'T')[0].baselineFix).toEqual(plan.workItems[0].baselineFix);
+
+    const bad = normalizePlan({ ...raw, workItems: [{ ...raw.workItems[0], baseline_fix: { files: ['src/controllers/x.ts'], reason: 'r' } }] }, 'T2-1');
+    expect(validatePlan(bad, ['api']).join(' ')).toMatch(/baseline fix may only touch test files or test-runner config, not src\/controllers\/x.ts/);
+  });
+});

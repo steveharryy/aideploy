@@ -193,7 +193,17 @@ export class PlanningAgent {
     if (floor && ['low', 'medium', 'high'].indexOf(plan.risk) < ['low', 'medium', 'high'].indexOf(floor)) {
       plan = { ...plan, risk: floor, riskReason: `${plan.riskReason ? `${plan.riskReason} ` : ''}(Raised to ${floor} by the component map's risk floor.)` };
     }
-    plan = { ...plan, warnings: [...plan.warnings, ...componentMapWarnings(plan, request.componentRepos)] };
+    plan = {
+      ...plan,
+      warnings: [
+        ...plan.warnings,
+        ...componentMapWarnings(plan, request.componentRepos),
+        // The approver must see this explicitly: approving the plan lets the coding agent edit test setup first.
+        ...plan.workItems
+          .filter((w) => w.baselineFix)
+          .map((w) => `${w.repo}: its existing tests already fail on the base branch. Approving this plan lets the coding agent first repair them, touching only ${w.baselineFix!.files.join(', ')} (${w.baselineFix!.reason}).`)
+      ]
+    };
     const problems = [...new Set([...validatePlan(plan, this.repos.map((r) => r.id), { requireGapAnalysis }), ...(plan.readiness === 'ready' ? extraProblems : [])])];
     // A plan for code the agent could not read is a guess. That is a pipeline setup problem
     // (not the reporter's), so it is flagged for every verdict and goes to a person, not back to the reporter.
@@ -439,7 +449,8 @@ Answer with ONLY one JSON object, no prose, no code fence, in exactly this shape
   "workItems": [{
     "id": "W1", "repo": "catalog repo id", "task": "what changes in this repo",
     "reason": "why this repo, citing file paths", "confidence": "high | medium | low",
-    "dependsOn": [], "filesLikelyTouched": ["src/..."], "approach": ["ordered steps"]
+    "dependsOn": [], "filesLikelyTouched": ["src/..."], "approach": ["ordered steps"],
+    "baselineFix": {"files": ["tsconfig.test.json"], "reason": "only if the existing tests already fail on the base branch"}
   }],
   "acceptanceCriteria": [{"id": "AC1", "text": "testable statement", "verify": "unit_test | qa_api_check | human", "workItem": "W1", "source": "ticket | derived"}],
   "testPlan": [{"ac": "AC1", "workItem": "W1", "name": "test_AC1_...", "cases": ["input → expected"]}],
