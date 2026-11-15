@@ -354,3 +354,39 @@ describe('planned baseline fix (planning side)', () => {
     expect(validatePlan(bad, ['api']).join(' ')).toMatch(/baseline fix may only touch test files or test-runner config, not src\/controllers\/x.ts/);
   });
 });
+
+describe('revision limit after an approval is withdrawn', () => {
+  it('counts revisions since the last approved version, not since v1', async () => {
+    const jobsDir = fs.mkdtempSync(path.join(tmp, 'revlimit-'));
+    fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
+    const { normalizePlan } = await import('../src/agents/planning/plan-rules.js');
+    const ticketPlan = normalizePlan({ readiness: 'ready', workItems: [{ id: 'W1', repo: 'api', task: 't' }], acceptanceCriteria: [{ id: 'AC1', text: 'x', verify: 'unit_test' }] }, 'T2-1');
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticketId: 'T2-1', version: 4, text: 'P', repos: [], plans: {}, ticketPlan, approvedBy: 'A', approvedAt: '2026-11-15T00:00:00Z' }));
+    let planned = 0;
+    const w = new AutomationWatcher(
+      { jql: 'x', labels: L, autoApprove: false, maxAttempts: 3, dryRun: false, maxPlanRevisions: 1 },
+      {
+        jira: {
+          searchTasks: async () => [ticket('T2-1', [L.ready])],
+          getTask: async () => ticket('T2-1', [L.ready]),
+          addComment: async () => {},
+          updateLabels: async () => {},
+          transition: async () => true,
+          getLabelAdder: async () => 'x'
+        },
+        jobsDir,
+        log: () => {},
+        attempts: () => 0,
+        plan: async () => (planned++, { status: 'ready', repos: [], plans: {}, text: 'P', ticketPlan }),
+        implement: async () => { throw new Error('no'); },
+        publish: async () => ({ links: [], skipped: [] })
+      }
+    );
+    const first = await w.runOnce();
+    expect(first.actions[0].detail ?? '').toBe('');
+    expect(first.actions[0].action).toBe('planned'); // v5: 1st revision since approved v4
+    expect(w.readPlan('T2-1')).toMatchObject({ version: 5, lastApprovedVersion: 4 });
+    expect((await w.runOnce()).actions[0].action).toBe('needs-info'); // v6 would be the 2nd
+    expect(planned).toBe(1);
+  });
+});

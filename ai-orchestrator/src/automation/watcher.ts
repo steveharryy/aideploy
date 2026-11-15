@@ -95,6 +95,8 @@ export interface SavedPlan {
   costUsd?: number;
   approvedBy?: string;
   approvedAt?: string;
+  /** Last version that was approved (then reopened). The revision limit counts from it. */
+  lastApprovedVersion?: number;
 }
 
 export interface WatcherJira {
@@ -406,7 +408,10 @@ export class AutomationWatcher {
     const reopening = revising && !!prior!.approvedAt;
     const version = revising ? (prior!.version ?? 1) + 1 : 1;
     const maxRevisions = this.config.maxPlanRevisions ?? 3;
-    if (revising && version > maxRevisions + 1) {
+    // Revisions since the plan was last approved (or since v1): an approval resets the count,
+    // so reopening an approved plan does not count the versions that were already agreed.
+    const lastApprovedVersion = reopening ? prior!.version ?? 1 : prior?.lastApprovedVersion;
+    if (revising && version - (lastApprovedVersion ?? 1) > maxRevisions) {
       this.deps.log(`${task.id}: plan revised ${maxRevisions} times without approval → back to reporter`);
       await this.sendBack(task, [
         `The plan for ${task.id} was revised ${maxRevisions} times without being approved.`,
@@ -511,6 +516,7 @@ export class AutomationWatcher {
       ...(outcome.ticketPlan ? { ticketPlan: outcome.ticketPlan } : {}),
       ...(outcome.repoDependencies ? { repoDependencies: outcome.repoDependencies } : {}),
       ...(outcome.ticketPlan ? { version } : {}),
+      ...(lastApprovedVersion ? { lastApprovedVersion } : {}),
       ...(outcome.promptVersion ? { promptVersion: outcome.promptVersion } : {}),
       ...(outcome.costUsd !== undefined ? { costUsd: outcome.costUsd } : {})
     };
