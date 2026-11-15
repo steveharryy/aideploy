@@ -202,6 +202,20 @@ describe('Jira comment formatting', () => {
     expect(line).toContain('Then add the label ai-ready again.');
     expect(texts).toContain('ai-ready'); // the code-marked node itself has no stray spaces
   });
+
+  it('question numbers and option letters are separated from their text', async () => {
+    const { questionsCommentAdf } = await import('../src/agents/planning/render-adf.js');
+    const plan = {
+      ticket: 'T2-1', assumptions: [],
+      questions: [{ id: 'Q1', text: 'Which path?', options: ['Template API', 'Webhook'], defaultOption: 'Template API' }]
+    } as unknown as Parameters<typeof questionsCommentAdf>[0];
+    const texts: string[] = [];
+    const walk = (n: { text?: string; content?: unknown[] }) => { if (n.text) texts.push(n.text); (n.content ?? []).forEach((c) => walk(c as typeof n)); };
+    walk(questionsCommentAdf(plan, 'ai-ready', 1, 2) as never);
+    const all = texts.join('');
+    expect(all).toContain('Q1. Which path?');
+    expect(all).toContain('How to answer: reply');
+  });
 });
 
 describe('coding phase switch', () => {

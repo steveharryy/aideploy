@@ -14,12 +14,11 @@ export type AdfNode = Record<string, unknown>;
 // ── tiny builders ───────────────────────────────────────────────────────────────────────────
 
 const clean = (s: string | undefined | null) => (s ?? '').replace(/\s+/g, ' ').trim();
-// Inline text keeps its edge spaces (collapsed, not trimmed): text nodes sit next to code/strong
-// nodes in one paragraph, and trimming glued them together ("the labelai-readyagain").
-// Marked text (code, strong, em) is trimmed so a mark never wraps a stray space.
+// Inline text keeps its edge spaces (collapsed, never trimmed): text, strong and code nodes sit
+// side by side in one paragraph, and callers put the separating space in deliberately
+// (strong('Q1. '), text(' again')). Trimming glued them together ("Q1.What", "labelai-ready").
 const text = (s: string, marks?: AdfNode[]): AdfNode => {
-  const collapsed = (s ?? '').replace(/\s+/g, ' ');
-  const value = marks ? collapsed.trim() : collapsed;
+  const value = (s ?? '').replace(/\s+/g, ' ');
   return { type: 'text', text: value.trim() ? value : '-', ...(marks ? { marks } : {}) };
 };
 const strong = (s: string) => text(s, [{ type: 'strong' }]);
