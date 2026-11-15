@@ -7,7 +7,7 @@
 # Fields per repo:
 #   id          unique id (used by plans and the component map)
 #   path        absolute, or relative to REPOSITORIES_ROOT (default: ai-orchestrator/repositories)
-#   baseBranch  the branch planning reads and ticket branches start from (team decision: main)
+#   baseBranch  the branch planning reads and ticket branches start from (team decision: PRE, the integration branch; gb-bo-admin-fe uses lower-case "pre")
 #   bitbucket   where pull requests are opened
 #   keywords    whole-word hints for routing (the Planning Agent confirms in the code)
 #   verify      commands that must ALL pass, starting with install
@@ -23,7 +23,7 @@ repos:
       proxies user activity/exposure to the Match and ATH services.
     owner: gamebull
     path: ../.repos/gb-homepage-api-service
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gb-homepage-api-service }
     keywords: [homepage-service, gb-homepage, homepage, getExposure, ActivityController, EventController, MarketController,
                HomePageController, SportsBullController, IpService, buildEventsV2Response, getUserCountry]
@@ -40,7 +40,7 @@ repos:
       payment endpoints.
     owner: gamebull
     path: ../.repos/gb-payments-api-service
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gb-payments-api-service }
     keywords: [deposit, withdrawal, withdraw, payments-api, payment gateway, fzpay, payplus, webxpay, oxprocessing,
                0xprocessing, crypto network, transactionController, walletResponse]
@@ -57,7 +57,7 @@ repos:
       images, MMP and activity data.
     owner: gamebull
     path: ../.repos/gb-event-api-service
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gb-event-api-service }
     keywords: [event-api, event-service, mmp, season, banner, category, team, eventController, marketController]
     modules: [events]
@@ -72,7 +72,7 @@ repos:
       game providers (Alea, QTech), Freshdesk and backoffice user endpoints.
     owner: gamebull
     path: ../.repos/gb-onboarding-api-service
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gb-onboarding-api-service }
     keywords: [onboarding, signup, sign up, registration, login, otp, freshdesk, qtech, alea, onboarding-service]
     modules: [onboarding]
@@ -87,7 +87,7 @@ repos:
       webhook endpoints.
     owner: gamebull
     path: ../.repos/gb-backoffice-api-service
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gb-backoffice-api-service }
     keywords: [backoffice-api, backoffice api, permission, permissions, role, roles, admin user, WebhookController]
     modules: [backoffice-api]
@@ -102,7 +102,7 @@ repos:
       dashboards); talks to the backoffice, payments and event APIs.
     owner: gamebull
     path: ../.repos/gb-bo-admin-fe
-    baseBranch: main
+    baseBranch: pre
     bitbucket: { workspace: rosstech, repo: gb-bo-admin-fe }
     keywords: [admin panel, backoffice ui, bo-admin, admin-fe, backoffice screen]
     modules: [backoffice-ui]
@@ -118,7 +118,7 @@ repos:
       wallet, deposit/withdrawal UI, onboarding and profile.
     owner: gamebull
     path: ../.repos/gamebull-global-new
-    baseBranch: main
+    baseBranch: PRE
     bitbucket: { workspace: rosstech, repo: gamebull-global-new }
     keywords: [gamebull-global, gamebull web, player app, website, frontend, ui, ux, screen, page, button]
     modules: [player-web]

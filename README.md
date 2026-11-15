@@ -43,7 +43,7 @@ Intake ──── plain code, no AI cost: description, issue type, size (+ pro
    ▼
 Planning agent ─── Claude Code with all built-in tools OFF, only 5 guarded tools:
    │                 jira_read · list_repos · search_code · read_file · submit_plan
-   │                 reads the real repos (pipeline-owned clones on main)
+   │                 reads the real repos (pipeline-owned clones on PRE)
    ▼
 Decision (code, not the AI)
    ├─ expected behaviour or product/repo missing  → comment: what is missing   (needs_info)
@@ -56,7 +56,7 @@ People in Jira ── answer in a comment + re-add ai-ready (loops back to Conte
    │               request changes: comment + ai-ready → plan v2, v3…
    │               approve: add label ai-approved
    ▼
-Coding (after approval only) ── per repo, in plan order, on branch ai/<ticket> from main
+Coding (after approval only) ── per repo, in plan order, on branch ai/<ticket> from PRE
    │   Claude Code in a sandbox copy: tests first (must fail) → code → verify
    │   pipeline checks: files stay in the repo, no test deleted/skipped; re-runs verify itself
    ▼
@@ -93,7 +93,7 @@ Clone the repos the pipeline may work on into `ai-orchestrator/.repos/` (gitigno
 
 ```bash
 mkdir -p .repos && cd .repos
-git clone --branch main git@ssh.bitbucket.org:rosstech/gb-event-api-service.git
+git clone --branch PRE git@ssh.bitbucket.org:rosstech/gb-event-api-service.git
 # … one per repo listed in catalog/repos.yaml
 git -C gb-event-api-service pull --ff-only   # refresh before planning
 ```
@@ -172,7 +172,7 @@ There is no Slack integration; Jira is the only channel.
 
 Current settings for **T2**: no Product or component required, issue types Story, Task and Bug, at most 3 story points. Moving tickets through Jira workflow statuses per phase is mapped in `pipeline.yaml` but **off** (`move_status: false`) until the mapping is agreed.
 
-Repos in the catalog today (all on `main`): gb-homepage-api, gb-payments-api, gb-event-api, gb-onboarding-api, gb-backoffice-api, gb-bo-admin-fe, gamebull-web. `gb-webhook-api-service` is left out because its `main` has no code.
+Repos in the catalog today (base branch `PRE`, the integration branch; `pre` for gb-bo-admin-fe; PRs target it): gb-homepage-api, gb-payments-api, gb-event-api, gb-onboarding-api, gb-backoffice-api, gb-bo-admin-fe, gamebull-web. `gb-webhook-api-service` is left out because its `main` has no code.
 
 ---
 
@@ -209,7 +209,7 @@ Repos in the catalog today (all on `main`): gb-homepage-api, gb-payments-api, gb
 - Separate git worktree on `ai/<ticket>`; the agent works in a sandbox copy without secrets.
 - Changes outside the repo, or that delete, skip or weaken tests, are rejected.
 - The pipeline re-runs verify itself.
-- Only `ai/*` branches are pushed, never `main`; nothing is merged or deployed.
+- Only `ai/*` branches are pushed, never `PRE` or `main`; nothing is merged or deployed.
 - At most 3 attempts.
 
 ---
