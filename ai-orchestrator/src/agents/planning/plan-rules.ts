@@ -1,3 +1,5 @@
+import type { WorkItem as CodingWorkItem } from '../coding/work-item.js';
+import { normaliseAcId } from '../coding/work-item.js';
 import type { TaskInput } from '../../models/types.js';
 import { CHECKLIST_ITEMS, CHECKLIST_LABELS, ESSENTIAL_ITEMS } from './types.js';
 import type {
@@ -488,4 +490,45 @@ export function sameQuestion(a: { text: string; options: string[] }, b: { text: 
   let shared = 0;
   for (const w of wa) if (wb.has(w)) shared++;
   return shared / Math.min(wa.size, wb.size) >= 0.6;
+}
+
+/**
+ * Hand-off to the coding agent: the approved plan as one coding work item per repo
+ * (contract: src/agents/coding/work-item.ts, schemas/work-item.schema.json).
+ * The coding agent then builds exactly the approved acceptance criteria and test plan instead of
+ * re-deriving them from the Jira ticket. ACs without a planned test (checked by a person or QA)
+ * are passed as notes, not as ACs the coding agent must prove with a test.
+ */
+export function workItemsForCoding(plan: TicketPlan, title: string): CodingWorkItem[] {
+  return plan.workItems.flatMap((item) => {
+    const tests = plan.testPlan.filter((t) => t.workItem === item.id);
+    const tested = new Set(tests.map((t) => normaliseAcId(t.ac)));
+    const acs = plan.acceptanceCriteria.filter((ac) => ac.workItem === item.id);
+    const codedAcs = acs.filter((ac) => tested.has(normaliseAcId(ac.id)));
+    if (!codedAcs.length) return [];
+    const others = acs.filter((ac) => !tested.has(normaliseAcId(ac.id)));
+    const steps = item.approach.map((a, i) => `${i + 1}. ${a}`).join(' ');
+    return [
+      {
+        ticket: plan.ticket,
+        workItemId: item.id,
+        repo: item.repo,
+        title,
+        summary: `${item.task}${steps ? ` Approach: ${steps}` : ''}`,
+        acceptanceCriteria: codedAcs.map((ac) => ({ id: normaliseAcId(ac.id), text: ac.text })),
+        testPlan: tests
+          .filter((t) => codedAcs.some((ac) => normaliseAcId(ac.id) === normaliseAcId(t.ac)))
+          .map((t) => ({ ac: normaliseAcId(t.ac), name: t.name, description: t.cases.join('; ') || t.name })),
+        plannedFiles: item.filesLikelyTouched.map((p) => ({ path: p, change: item.task })),
+        ...(plan.contract.length ? { contract: plan.contract.join('\n') } : {}),
+        assumptions: [
+          ...plan.assumptions,
+          ...plan.outOfScope.map((o) => `Out of scope: ${o}`),
+          ...others.map((ac) => `${ac.id} is verified outside the code (${ac.verify}): ${ac.text}`),
+          ...(item.dependsOn.length ? [`Depends on work items: ${item.dependsOn.join(', ')}`] : [])
+        ],
+        clarifications: plan.clarifications
+      }
+    ];
+  });
 }

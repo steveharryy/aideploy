@@ -303,3 +303,34 @@ describe('rejecting an approved plan', () => {
     expect(w.sessions.get('T2-1')?.phase).toBe('plan_review');
   });
 });
+
+describe('planning → coding hand-off', () => {
+  it('turns an approved plan into valid coding work items; untested ACs become notes', async () => {
+    const { workItemsForCoding } = await import('../src/agents/planning/plan-rules.js');
+    const { validateWorkItem } = await import('../src/agents/coding/work-item.js');
+    const plan = {
+      ticket: 'T2-1', summary: 's', assumptions: ['a1'], clarifications: ['Q1: A (product)'], outOfScope: ['stage 2'],
+      contract: ['POST /x {id}'],
+      workItems: [
+        { id: 'W1', repo: 'gb-payments-api', task: 'send it', reason: 'r', confidence: 'high', dependsOn: [], filesLikelyTouched: ['src/a.ts'], approach: ['add client', 'call it'] },
+        { id: 'W2', repo: 'gb-onboarding-api', task: 'docs only', reason: 'r', confidence: 'high', dependsOn: [], filesLikelyTouched: [], approach: [] }
+      ],
+      acceptanceCriteria: [
+        { id: 'AC1', text: 'sends once', verify: 'unit_test', workItem: 'W1', source: 'ticket' },
+        { id: 'AC2', text: 'baselines captured', verify: 'human', workItem: 'W1', source: 'ticket' },
+        { id: 'AC3', text: 'reviewed', verify: 'human', workItem: 'W2', source: 'derived' }
+      ],
+      testPlan: [{ ac: 'AC1', workItem: 'W1', name: 'test_AC1_sends_once', cases: ['retry', 'restart'] }]
+    } as unknown as Parameters<typeof workItemsForCoding>[0];
+    const items = workItemsForCoding(plan, 'Title');
+    expect(items.map((w) => w.repo)).toEqual(['gb-payments-api']); // W2 has nothing the coding agent can test
+    const [w] = items;
+    expect(validateWorkItem(w)).toEqual([]);
+    expect(w.acceptanceCriteria).toEqual([{ id: 'AC1', text: 'sends once' }]);
+    expect(w.testPlan).toEqual([{ ac: 'AC1', name: 'test_AC1_sends_once', description: 'retry; restart' }]);
+    expect(w.summary).toContain('1. add client 2. call it');
+    expect(w.contract).toBe('POST /x {id}');
+    expect(w.assumptions?.join(' ')).toMatch(/AC2 is verified outside the code \(human\)/);
+    expect(w.clarifications).toEqual(['Q1: A (product)']);
+  });
+});

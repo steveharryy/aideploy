@@ -84,6 +84,28 @@ export class BitbucketClient {
     throw new Error('Bitbucket is not configured: set BITBUCKET_TOKEN (repository access token) or BITBUCKET_EMAIL + BITBUCKET_API_TOKEN.');
   }
 
+  /**
+   * Git over HTTPS takes different usernames than the REST API (REST: email + API token).
+   * API token → "x-bitbucket-api-token-auth" (verified against bitbucket.org); access token → "x-token-auth".
+   */
+  private gitAuthHeader(): string {
+    const basic = (user: string, secret: string) => `Basic ${Buffer.from(`${user}:${secret}`).toString('base64')}`;
+    if (this.token) return basic('x-token-auth', this.token);
+    if (this.apiToken) return basic('x-bitbucket-api-token-auth', this.apiToken);
+    throw new Error('Bitbucket is not configured: set BITBUCKET_TOKEN (repository access token) or BITBUCKET_EMAIL + BITBUCKET_API_TOKEN.');
+  }
+
+  /**
+   * Environment that authenticates git fetches from bitbucket.org with the configured credentials.
+   * Scoped to https://bitbucket.org/ so the token is never sent to any other remote, and passed
+   * through git's GIT_CONFIG_* variables, never on the command line (process lists, error text).
+   */
+  gitRemoteEnv(): Record<string, string> {
+    return this.configured
+      ? { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.https://bitbucket.org/.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: ${this.gitAuthHeader()}` }
+      : {};
+  }
+
   static assertPushableBranch(branch: string): void {
     if (!/^ai\/[a-z0-9._-]+$/i.test(branch)) {
       throw new Error(`Refusing to push "${branch}": only ai/* ticket branches may be pushed by the orchestrator.`);
@@ -100,7 +122,7 @@ export class BitbucketClient {
       await this.git(workdir, ['push', url, `${branch}:${branch}`], {
         GIT_CONFIG_COUNT: '1',
         GIT_CONFIG_KEY_0: 'http.extraHeader',
-        GIT_CONFIG_VALUE_0: `Authorization: ${this.authHeader()}`
+        GIT_CONFIG_VALUE_0: `Authorization: ${this.gitAuthHeader()}`
       });
     } else {
       await this.git(workdir, ['push', 'origin', `${branch}:${branch}`]);

@@ -6,6 +6,8 @@ import {
   AutomationWatcher,
   DEFAULT_LABELS,
   buildPrDescription,
+  qualitySummary,
+  readCodingReport,
   type PlanOutcome,
   type WatcherConfig,
   type WatcherDeps,
@@ -71,7 +73,7 @@ function setup(tickets: TaskInput[], overrides: Partial<WatcherDeps> = {}, confi
     },
     publish: async () => {
       calls.publish++;
-      return { links: [{ repoId: 'gb', url: 'https://bitbucket.org/rosstech/gb/pull-requests/7', existing: false }], skipped: [] };
+      return { links: [{ repoId: 'gb', url: 'https://bitbucket.org/ws/gb/pull-requests/7', existing: false }], skipped: [] };
     },
     ...overrides
   };
@@ -112,7 +114,7 @@ describe('AutomationWatcher', () => {
     expect(calls.implement[0].metadata?.approvedPlans).toEqual({ gb: { summary: 'do it' } });
     expect(calls.publish).toBe(1);
     const last = jira.comments.at(-1)!.lines.join('\n');
-    expect(last).toContain('https://bitbucket.org/rosstech/gb/pull-requests/7');
+    expect(last).toContain('https://bitbucket.org/ws/gb/pull-requests/7');
     expect(last).toMatch(/nothing is merged or deployed automatically/);
     expect(jira.labelOps).toContainEqual({ key: 'T2-1', add: [], remove: [L.approved] });
     expect(jira.labelOps.every((op) => op.add.length === 0)).toBe(true);
@@ -232,6 +234,54 @@ describe('AutomationWatcher', () => {
     expect(md).toContain('PLAN BODY');
     expect(md).toContain('`tests/a.test.ts`');
     expect(md).toContain('✅ verify:test');
+    expect(md).not.toContain('How this change was tested and reviewed'); // no coding report → no section
+  });
+
+  it('PR description shows how the coding agent tested and the reviewer reviewed (this run only)', () => {
+    const jobsDir = fs.mkdtempSync(path.join(jobsRoot, 'report-'));
+    const result = okResult('T2-1');
+    result.teamResult!.repoResults[0].providerUsed = 'coding-agent';
+    const report = {
+      ticket: 'T2-1', workItem: 'W1', repo: 'gb', status: 'ready_for_pr', summary: 'fixed',
+      acceptanceCriteria: [{ id: 'AC1', text: 'x', status: 'met', evidence: ['tests/a.test.ts › test_AC1_page_two_reads_30_59'] }],
+      testsFirst: { baselinePassed: true, files: ['tests/a.test.ts'], failedBeforeChange: true },
+      checks: [{ name: 'typecheck', passed: true, durationMs: 1 }, { name: 'test', passed: true, durationMs: 1 }],
+      scope: { changedFiles: [], outOfPlan: [], secrets: [], debugLeftovers: [], revertedFiles: [] },
+      review: { verdict: 'approve', rounds: 2, findings: [{ severity: 'minor', file: 'src/a.ts', line: 3, issue: 'name could be clearer' }] },
+      iterationsUsed: 1, maxIterations: 3,
+      fixRounds: [{ round: 1, phase: 'review', problems: ['Review blocker: page 2 is empty'] }],
+      questions: [], assumptionsMade: ['Redis zrange end is inclusive'], openIssues: [], claudeCalls: 5, durationMs: 1
+    };
+    fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'coding-gb.json'), JSON.stringify(report));
+
+    const coding = readCodingReport(jobsDir, result, 'T2-1', 'gb');
+    const md = buildPrDescription(ticket('T2-1', []), result, { ticketId: 'T2-1', createdAt: '', repos: ['gb'], plans: {}, text: 'PLAN' }, 'gb', coding);
+    expect(md).toContain('### How this change was tested and reviewed');
+    expect(md).toContain('FAILING on the old code');
+    expect(md).toContain('✅ AC1 met: `test_AC1_page_two_reads_30_59`');
+    expect(md).toContain('Independent AI review');
+    expect(md).toContain('APPROVED after 2 round(s)');
+    expect(md).toContain('[minor] `src/a.ts:3` name could be clearer');
+    expect(md).toContain('round 1 (review): Review blocker: page 2 is empty');
+    expect(md).toContain('Redis zrange end is inclusive');
+    expect(qualitySummary(coding!, false).join('\n')).not.toContain('`'); // plain text for Jira
+
+    // A report from another provider's run (or an earlier run) is never shown.
+    result.teamResult!.repoResults[0].providerUsed = 'claude-code';
+    expect(readCodingReport(jobsDir, result, 'T2-1', 'gb')).toBeUndefined();
+  });
+});
+
+describe('AutomationWatcher: retry after a failure', () => {
+  it('the failure comment tells the user how to retry', async () => {
+    const failing = { ...okResult('T2-1'), success: false, status: 'EXECUTION_FAILED' as const, error: 'boom' };
+    const { watcher, jira } = setup([ticket('T2-1', [L.approved])], { implement: async () => failing });
+    // An approved ticket needs a plan on record first.
+    fs.mkdirSync(path.join((watcher as any).deps.jobsDir, 'T2-1'), { recursive: true });
+    fs.writeFileSync(path.join((watcher as any).deps.jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticketId: 'T2-1', createdAt: new Date().toISOString(), repos: ['gb'], plans: {}, text: 'P' }));
+    expect((await watcher.runOnce()).actions[0].action).toBe('failed');
+    expect(jira.comments.at(-1)!.lines.join(' ')).toContain('add the label "ai-approved" again');
   });
 });
 
@@ -243,10 +293,26 @@ describe('BitbucketClient', () => {
     await expect(bb.pushBranch('/w', 'main', { workspace: 'ws', repo: 'r' })).rejects.toThrow(/only ai\/\* ticket branches/);
     await expect(bb.pushBranch('/w', 'develop', { workspace: 'ws', repo: 'r' })).rejects.toThrow();
     await bb.pushBranch('/w', 'ai/t2-547', { workspace: 'ws', repo: 'r' });
+    const b64 = (s: string) => Buffer.from(s).toString('base64');
     expect(git[0]).toEqual(['push', 'https://bitbucket.org/ws/r.git', 'ai/t2-547:ai/t2-547']);
     // The token travels in the environment, never on the command line (errors and `ps` show argv)
-    expect(git[0].join(' ')).not.toMatch(/Bearer|Authorization|x-token-auth/);
-    expect(envs[0]).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: 'Authorization: Bearer t' });
+    expect(git[0].join(' ')).not.toMatch(/Basic|Bearer|Authorization|x-token-auth/);
+    expect(envs[0]).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Basic ${b64('x-token-auth:t')}` });
+  });
+
+  it('git push with an API token uses the x-bitbucket-api-token-auth username, not the email', async () => {
+    const envs: Array<Record<string, string> | undefined> = [];
+    const bb = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api', git: async (_c, _a, env) => (envs.push(env), '') });
+    await bb.pushBranch('/w', 'ai/t2-587', { workspace: 'ws', repo: 'r' });
+    expect(envs[0]?.GIT_CONFIG_VALUE_0).toBe(`Authorization: Basic ${Buffer.from('x-bitbucket-api-token-auth:api').toString('base64')}`);
+    expect(JSON.stringify(envs[0])).not.toContain(Buffer.from('dev@example.com:api').toString('base64'));
+  });
+
+  it('fetch credentials are scoped to bitbucket.org only and passed in the environment', () => {
+    const env = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api' }).gitRemoteEnv();
+    expect(env.GIT_CONFIG_KEY_0).toBe('http.https://bitbucket.org/.extraHeader');
+    expect(env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic ')).toBe(true);
+    expect(new BitbucketClient({ token: '', email: '', apiToken: '' }).gitRemoteEnv()).toEqual({});
   });
 
   it('creates a PR with the right payload, or reuses an open one', async () => {
@@ -302,6 +368,8 @@ describe('Jira write-back', () => {
     expect(calls[0].url).toBe('https://x.atlassian.net/rest/api/3/issue/T2-1/comment');
     expect(JSON.parse(String(calls[0].init!.body)).body).toEqual(commentAdf(['line one'], 'PLAN'));
     expect(commentAdf(['a'], 'P').content?.[1]).toEqual({ type: 'codeBlock', content: [{ type: 'text', text: 'P' }] });
+    // Jira's ADF root shape: { version: 1, type: "doc", content } with NO attrs (attrs.version → 400 INVALID_INPUT).
+    expect(commentAdf(['a'])).toEqual({ type: 'doc', version: 1, content: [{ type: 'paragraph', content: [{ type: 'text', text: 'a' }] }] });
   });
 
   it('updates labels (204 No Content) and transitions by status name', async () => {

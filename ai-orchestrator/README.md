@@ -26,13 +26,19 @@ ai-orchestrator/
 │   │   │   ├── render-adf.ts      formatted Jira comments (plan, questions, missing info)
 │   │   │   ├── render.ts          plain-text versions (terminal and fallback)
 │   │   │   └── types.ts           plan, checklist and edge-case types
-│   │   ├── deduplication/, impact-analysis/, team-agent/, testing/   coding phase (from the POC)
+│   │   ├── coding/
+│   │   │   ├── coding-agent.ts    tests first → implement → checks → scope → independent reviewer
+│   │   │   ├── gates.ts           code-only pass/fail gates after every AI step
+│   │   │   └── work-item.ts       the planning → coding contract (schemas/work-item.schema.json)
+│   │   ├── deduplication/, impact-analysis/, team-agent/, testing/   pipeline stages (from the POC)
 │   ├── catalog/               service catalog and component map loaders
 │   ├── config/                pipeline.yaml loader and validation
 │   ├── integrations/          Jira and Bitbucket REST clients
 │   ├── jobs/                  session store (phases), job store, locks
-│   ├── providers/             AI providers: claude-code, claude, handoff, mock
+│   ├── providers/             AI providers: coding-agent, claude-code, claude, handoff, mock
+│   ├── code.ts                CLI for the coding agent alone: npm run code -- --work-item <file>
 │   └── workspace/             git worktree per ticket
+├── docs/CODING_AGENT.md       how the coding agent works (gates, review, report)
 ├── tests/                     vitest suites; tests/fixtures/sample-catalog.yaml for the demo repos
 └── repositories/              sample repos repo-a/b/c, used only by tests, QA and --demo
 ```
@@ -40,7 +46,7 @@ ai-orchestrator/
 ## Tests
 
 ```bash
-npm test            # 218 tests, no network, no Jira, no Claude
+npm test            # 261 tests, no network, no Jira, no Claude
 npm run typecheck
 ```
 
@@ -52,6 +58,10 @@ npm run typecheck
 2. Add it to `catalog/repos.yaml`: `id`, `name`, `purpose`, `path: ../.repos/<name>`, `baseBranch`, `bitbucket`, `keywords`, `verify` (start with the install step).
 3. Map its Jira components or area labels in `config/components.yaml`, with a `risk_floor` (`high` for money).
 4. Run `npm test`: a test checks that both config files load and agree with the catalog.
+
+## Planning → coding hand-off
+
+When a plan is approved and `coding.enabled` is `true` in `config/pipeline.yaml`, the watcher turns the approved plan into one coding work item per repo (`workItemsForCoding` in `plan-rules.ts`) and passes them as `task.metadata.workItems`. The coding agent then builds exactly the approved acceptance criteria and test plan. ACs checked by a person or QA go to the coding agent as notes. Details: [docs/CODING_AGENT.md](docs/CODING_AGENT.md).
 
 ## Changing the planning prompt
 

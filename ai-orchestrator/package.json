@@ -7,13 +7,12 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "qa": "tsx src/qa-runner.ts",
-    "clean": "tsx src/clean-repos.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "watch": "tsx src/index.ts --watch",
-    "webhook": "tsx src/index.ts --webhook"
+    "webhook": "tsx src/index.ts --webhook",
+    "code": "tsx src/code.ts"
   },
   "keywords": [
     "orchestrator",

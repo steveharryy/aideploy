@@ -7,6 +7,8 @@ import { renderMissing, renderQuestions } from '../agents/planning/render.js';
 import { missingInfoCommentAdf, planCommentAdf, questionsCommentAdf, type AdfNode } from '../agents/planning/render-adf.js';
 import { FileSessionStore, type SessionPhase, type SessionStore } from '../jobs/session-store.js';
 import { redactSecrets, safeErrorMessage } from '../util/redact.js';
+import { workItemsForCoding } from '../agents/planning/plan-rules.js';
+import type { CodingReport } from '../agents/coding/coding-agent.js';
 
 /**
  * The only labels in Jira: the two HUMAN triggers. The bot removes a trigger once it has acted
@@ -455,6 +457,7 @@ export class AutomationWatcher {
     if (outcome.status === 'no-repo') {
       await this.comment(task.id, [
         'Not started: no repository matched this ticket.',
+        ...(outcome.reason ? [`Reason: ${outcome.reason}`] : []),
         `Add a component for the target repo, or add the repo to catalog/repos.yaml, then add the label "${L.ready}" again.`
       ]);
       await this.toPhase(task.id, 'needs_human', clear, 'no matching repository');
@@ -622,7 +625,14 @@ export class AutomationWatcher {
       ...(fresh.metadata || {}),
       approvedPlans: plan.plans,
       // With a structured plan, the plan (not keyword routing) decides repos and order.
-      ...(plan.ticketPlan ? { approvedRepos: plan.repos, approvedRepoDependencies: plan.repoDependencies || {} } : {})
+      ...(plan.ticketPlan
+        ? {
+            approvedRepos: plan.repos,
+            approvedRepoDependencies: plan.repoDependencies || {},
+            // The coding agent builds exactly the approved ACs and test plan (one work item per repo).
+            workItems: workItemsForCoding(plan.ticketPlan, fresh.title)
+          }
+        : {})
     };
     const result = await this.deps.implement(fresh);
 
@@ -637,12 +647,18 @@ export class AutomationWatcher {
         .join('\n\n');
       await this.comment(
         task.id,
-        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), 'A person needs to look at this. To retry, add the approval label again.'],
+        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), `A person needs to look at this. To retry with the same approved plan, add the label "${L.approved}" again.`],
         failedCheck || undefined
       );
       await this.toPhase(task.id, 'needs_human', [], `implementation stopped: ${result.status}`);
       return 'failed';
     }
+
+    // How each repo's change was tested and reviewed (from the coding agent's report of this run).
+    const quality = (result.teamResult?.repoResults ?? []).flatMap((r) => {
+      const report = readCodingReport(this.deps.jobsDir, result, task.id, r.repoId);
+      return report ? [`How ${r.repoId} was tested and reviewed:`, ...qualitySummary(report, false)] : [];
+    });
 
     const { links, skipped } = await this.deps.publish(fresh, result, plan);
     if (links.length > 0) {
@@ -651,7 +667,8 @@ export class AutomationWatcher {
         ...links.map((l) => `PR (${l.repoId})${l.existing ? ' [updated existing]' : ''}: ${l.url}`),
         'Changed files:',
         ...changed,
-        'Verify:',
+        ...quality,
+        'Verify (re-run after applying):',
         ...verify
       ]);
       await this.toPhase(task.id, 'pr_open', [], links.map((l) => l.url).join(' '));
@@ -663,7 +680,8 @@ export class AutomationWatcher {
       ...skipped,
       'Changed files:',
       ...changed,
-      'Verify:',
+      ...quality,
+      'Verify (re-run after applying):',
       ...verify
     ]);
     await this.toPhase(task.id, 'done', [], 'verified, no PR');
@@ -690,7 +708,52 @@ export class AutomationWatcher {
 }
 
 /** Markdown PR description: ticket, approved plan, verify results. */
-export function buildPrDescription(task: TaskInput, result: OrchestratorResult, plan: SavedPlan, repoId: string): string {
+/**
+ * The coding agent's report for one repo of THIS run (.jobs/<ticket>/coding-<repo>.json).
+ * Only used when the coding agent actually produced this run's change, so a stale report from an
+ * earlier run (e.g. with another provider) is never shown.
+ */
+export function readCodingReport(jobsDir: string, result: OrchestratorResult, ticketId: string, repoId: string): CodingReport | undefined {
+  const repo = result.teamResult?.repoResults.find((r) => r.repoId === repoId);
+  if (!repo || repo.providerUsed !== 'coding-agent') return undefined;
+  try {
+    const file = path.join(jobsDir, ticketId.replace(/[^A-Za-z0-9._-]/g, '_'), `coding-${repoId}.json`);
+    const report = JSON.parse(fs.readFileSync(file, 'utf-8')) as CodingReport;
+    return report.status === 'ready_for_pr' ? report : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+const testName = (evidence: string) => evidence.split(' › ').pop() ?? evidence;
+
+/** How the change was tested and reviewed. markdown=true for PR descriptions, false for Jira comments. */
+export function qualitySummary(r: CodingReport, markdown: boolean): string[] {
+  const code = (s: string) => (markdown ? `\`${s}\`` : s);
+  const bold = (s: string) => (markdown ? `**${s}**` : s);
+  const tf = r.testsFirst;
+  const blocking = r.review.findings.filter((f) => f.severity !== 'minor');
+  const notes = r.review.findings.map(
+    (f) => `- [${f.severity}] ${f.file ? `${code(`${f.file}${f.line ? `:${f.line}` : ''}`)} ` : ''}${f.issue}${f.suggestion ? ` (suggestion: ${f.suggestion})` : ''}`
+  );
+  const lines = [
+    `${bold('1. Tests written first:')} ${tf.files.length} test file(s), written before the code and ${tf.failedBeforeChange ? 'FAILING on the old code (proves they test the change)' : 'not proven to fail on the old code'}: ${tf.files.map(code).join(', ')}`,
+    `${bold('2. Acceptance criteria → tests:')}`,
+    ...r.acceptanceCriteria.map(
+      (a) =>
+        `- ${a.status === 'met' ? '✅' : '⚠️'} ${a.id} ${a.status}${a.evidence.length ? `: ${a.evidence.slice(0, 2).map((e) => code(testName(e))).join(', ')}${a.evidence.length > 2 ? ` (+${a.evidence.length - 2} more)` : ''}` : ''}`
+    ),
+    `${bold('3. Checks run by the pipeline itself:')} ${r.checks.map((c) => `${c.passed ? '✅' : '❌'} ${c.name}`).join(' · ')}`,
+    `${bold('4. Independent AI review')} (fresh session, read-only, saw the ticket, plan, diff and check results): ${r.review.verdict === 'approve' || blocking.length === 0 ? 'APPROVED' : r.review.verdict.toUpperCase()} after ${r.review.rounds} round(s)${r.review.findings.length ? `, ${r.review.findings.length} note(s)${blocking.length ? '' : ' (non-blocking)'}:` : ', no findings.'}`,
+    ...notes,
+    `${bold('Fix rounds:')} ${r.fixRounds.length === 0 ? 'none needed' : r.fixRounds.map((f) => `round ${f.round} (${f.phase}): ${f.problems[0] ?? ''}`.slice(0, 200)).join(' | ')}`
+  ];
+  if (r.scope.revertedFiles.length) lines.push(`${bold('Reverted by the pipeline:')} ${r.scope.revertedFiles.join('; ')}`);
+  if (r.assumptionsMade.length) lines.push(`${bold('Assumptions the agent made:')}`, ...r.assumptionsMade.slice(0, 5).map((a) => `- ${a}`));
+  return lines;
+}
+
+export function buildPrDescription(task: TaskInput, result: OrchestratorResult, plan: SavedPlan, repoId: string, coding?: CodingReport): string {
   const repoResult = result.teamResult?.repoResults.find((r) => r.repoId === repoId);
   const checks = result.testingResult?.repoResults.find((r) => r.repoId === repoId)?.checks ?? [];
   return [
@@ -708,13 +771,19 @@ export function buildPrDescription(task: TaskInput, result: OrchestratorResult, 
     '### Files changed',
     ...(repoResult?.changedFiles ?? []).map((f) => `- \`${f}\``),
     '',
-    '### Verify results',
+    ...(coding ? ['### How this change was tested and reviewed', ...qualitySummary(coding, true), ''] : []),
+    '### Verify results (re-run on this branch after the change was applied)',
     ...checks.filter((c) => c.name !== 'directory-exists').map((c) => `- ${c.passed ? '✅' : '❌'} ${c.name}`),
     '',
     '---',
-    'Generated by the AI development orchestrator (tests written first; pipeline-verified).',
-    'Review required: nothing is merged or deployed automatically.'
+    'Generated by the AI development orchestrator (tests written first; pipeline-verified; AI-reviewed).',
+    'Human review required: nothing is merged or deployed automatically.'
   ]
     .filter((l, i, a) => !(l === '' && a[i - 1] === ''))
     .join('\n');
+}
+
+/** Jira timestamps use "+0530" offsets; normalise to "+05:30" so Date.parse is reliable. */
+export function parseJiraDate(value: string): number {
+  return Date.parse(String(value || '').replace(/([+-]\d{2})(\d{2})$/, '$1:$2'));
 }

@@ -13,9 +13,11 @@ import { ClaudeProvider } from './providers/claude-provider.js';
 import { HandoffProvider } from './providers/handoff-provider.js';
 import { ClaudeCodeProvider, type ImplementationPlan } from './providers/claude-code-provider.js';
 import { PlanningAgent, PlanningRunError, type PlannerRepo } from './agents/planning/planning-agent.js';
-import { codingBrief, repoDependencies } from './agents/planning/plan-rules.js';
+import { codingBrief, repoDependencies, workItemsForCoding } from './agents/planning/plan-rules.js';
 import { renderMissing, renderPlan, renderQuestions } from './agents/planning/render.js';
 import type { PlanQuestion, TicketPlan } from './agents/planning/types.js';
+import { CodingAgentProvider } from './providers/coding-agent-provider.js';
+import type { CodingReport } from './agents/coding/coding-agent.js';
 import { JiraClient } from './integrations/jira/jira-client.js';
 import { ServiceCatalog } from './catalog/service-catalog.js';
 import { ComponentMap } from './catalog/component-map.js';
@@ -29,6 +31,7 @@ import {
   AutomationWatcher,
   DEFAULT_LABELS,
   buildPrDescription,
+  readCodingReport,
   type PlanOutcome,
   type PullRequestLink,
   type WatcherLabels
@@ -73,7 +76,30 @@ function makeJira(): JiraClient {
 }
 const worktreesDir = path.resolve(process.cwd(), process.env.WORKTREES_DIR || '.worktrees');
 
-const PROVIDERS = ['mock', 'claude', 'claude-code', 'handoff'];
+const PROVIDERS = ['mock', 'claude', 'claude-code', 'coding-agent', 'handoff'];
+
+/** Providers whose planning step is drafted by Claude Code (read-only). */
+const CLAUDE_CODE_PROVIDERS = ['claude-code', 'coding-agent'];
+
+/** Saves the coding agent's structured result next to the job record. */
+function saveCodingReport(report: CodingReport, diff: string): void {
+  const dir = path.join(jobsDir, report.ticket.replace(/[^A-Za-z0-9._-]/g, '_'));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `coding-${report.repo}.json`), JSON.stringify(report, null, 2));
+  // Exactly what this ticket changed in this repo; works even when the repo folder is not a git clone.
+  const diffFile = path.join(dir, `changes-${report.repo}.diff`);
+  if (diff) fs.writeFileSync(diffFile, diff.endsWith('\n') ? diff : `${diff}\n`);
+  else fs.rmSync(diffFile, { force: true });
+}
+
+function makeCodingAgentProvider(catalog: ServiceCatalog | undefined): CodingAgentProvider {
+  return new CodingAgentProvider({
+    verifyFor: (id) => catalog?.verifyCommands(id) ?? [],
+    purposeFor: (id) => catalog?.get(id)?.purpose,
+    onReport: saveCodingReport,
+    agent: { log: (m) => console.log(m) }
+  });
+}
 
 export interface CreateOrchestratorOptions {
   /** Human approval after impact analysis, before any code is written. */
@@ -86,7 +112,7 @@ function loadCatalog(): ServiceCatalog | undefined {
 }
 
 export function createOrchestrator(providerType?: string, options: CreateOrchestratorOptions = {}): Orchestrator {
-  const chosenProvider = providerType || process.env.AI_PROVIDER || 'claude-code';
+  const chosenProvider = providerType || process.env.AI_PROVIDER || 'coding-agent';
 
   // Service catalog (catalog/repos.yaml): routing, repo paths, deploy order, verify contract.
   // If the file is missing, every agent falls back to its built-in defaults.
@@ -95,7 +121,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
 
   // mock     = offline, free (default)
   // claude   = Anthropic API (needs API credits)
-  // claude-code = Claude Code CLI as the coding agent, in a sandbox copy (uses the developer's Claude login)
+  // claude-code = Claude Code CLI, single pass in a sandbox copy (uses the developer's Claude login)
+  // coding-agent = full coding agent (tests first → implement → checks → scope → reviewer), Claude Code based
   // handoff  = change set prepared by an external agent, applied through the same guards
   // Fail loudly on anything else rather than silently running a different provider.
   const providerKey = chosenProvider.toLowerCase();
@@ -107,6 +134,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
       ? new ClaudeProvider()
       : providerKey === 'claude-code'
         ? makeClaudeCodeProvider(catalog)
+        : providerKey === 'coding-agent'
+          ? makeCodingAgentProvider(catalog)
         : providerKey === 'handoff'
           ? new HandoffProvider()
           : new MockAIProvider();
@@ -139,10 +168,20 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
     // One run per ticket + persisted stage history in .jobs/<ticket>/job.json
     jobStore: new JobStore({ jobsDir }),
     // Standalone git repos get an isolated ai/<ticket> branch + worktree; others run in place.
-    workspace: new GitWorkspaceManager({ worktreesDir }),
+    // The base branch is fetched from origin first (Bitbucket login scoped to bitbucket.org).
+    workspace: makeWorkspace(),
     resolveRepoPath: (repoId) => repoPaths[repoId] || path.resolve(repoRoot, repoId),
     resolveBaseBranch: (repoId) => catalog?.get(repoId)?.baseBranch,
     approvePlan: options.approvePlan
+  });
+}
+
+/** Worktrees per ticket; base branches are fetched from origin first (Bitbucket login scoped to bitbucket.org). */
+function makeWorkspace(): GitWorkspaceManager {
+  return new GitWorkspaceManager({
+    worktreesDir,
+    remoteGitEnv: () => new BitbucketClient().gitRemoteEnv(),
+    log: (m) => console.log(`[WORKSPACE] ${m}`)
   });
 }
 
@@ -209,6 +248,8 @@ async function repoExecutionLines(
   const repoPath = catalog?.resolvePath(repoId) ?? path.resolve(repoRoot, repoId);
   const isGit = await GitWorkspaceManager.isGitRepoRoot(repoPath);
   const branch = GitWorkspaceManager.branchName('ai/', task.id);
+  const baseBranch = catalog?.get(repoId)?.baseBranch;
+  const prTarget = isGit && catalog?.get(repoId)?.bitbucket && baseBranch && new BitbucketClient().configured ? baseBranch : undefined;
   const verify = catalog?.verifyCommands(repoId).map((v) => v.run) ?? [];
   const verifyText = verify.length ? verify.join('  →  ') : 'make verify / npm test (fallback)';
 
@@ -217,11 +258,18 @@ async function repoExecutionLines(
     `REPOSITORY  ${repoId}${catalog?.get(repoId)?.name ? `  (${catalog.get(repoId)!.name})` : ''}`,
     `  Why this repo : ${why}`,
     `  Path          : ${repoPath}`,
-    `  Changes go to : ${isGit ? `new branch ${branch} in a separate worktree (your checkout is not touched)` : 'the folder itself (not a standalone git repo, so no branch)'}`,
+    `  Changes go to : ${isGit ? `new branch ${branch} from the latest ${baseBranch ? `origin/${baseBranch}` : 'checked-out commit'}, in a separate worktree (your checkout is not touched)` : 'the folder itself (not a standalone git repo, so no branch)'}`,
     `  Verify        : ${verifyText}`
   ];
   const tail = ['', '  Process after approval'];
-  if (providerName === 'claude-code') {
+  if (providerName === 'coding-agent') {
+    tail.push(
+      `     1) Copy ${repoId} to a sandbox; baseline: every verify step must pass before any change`,
+      '     2) Coding agent writes tests named per AC (AC1…); pipeline checks: only test files, every AC covered, suite now FAILS',
+      '     3) Coding agent implements (tests locked); pipeline runs the checks + scope gates (secrets, debug output, out-of-plan files);',
+      `        an independent reviewer agent checks the diff; fix rounds share a budget. Verify: ${verifyText}`
+    );
+  } else if (providerName === 'claude-code') {
     tail.push(
       `     1) Copy ${repoId} to a temporary sandbox (the real folder is not touched yet)`,
       '     2) Claude Code writes the tests first and confirms they FAIL on the current code',
@@ -234,7 +282,8 @@ async function repoExecutionLines(
     '     4) Pipeline safety checks: every file stays inside the repo; no test deleted, skipped or weakened',
     `     5) Pipeline applies the changes to ${isGit ? `branch ${branch} (separate worktree)` : 'the folder in place'}`,
     `     6) Pipeline re-runs the verify steps itself: ${verifyText}`,
-    `     7) Result saved to .jobs/${task.id}/ (job.json + plan.md)${isGit ? `; commit on ${branch}, never pushed` : ''}`,
+    `     7) Result saved to .jobs/${task.id}/ (job.json, coding report, diff)${isGit ? `; commit on ${branch}` : ''}`,
+    `     8) ${prTarget ? `Push ${branch} and open a pull request into ${prTarget}; it is never merged automatically` : 'No pull request (needs a git clone + bitbucket/baseBranch in the catalog + Bitbucket credentials)'}`,
     `  Rollback      : ${isGit ? `delete branch ${branch} and its worktree; your base branch is never changed` : 'no git history in this folder: restore from a backup/copy (or clone the real repo to get branch-based rollback)'}`
   );
   return { header, tail };
@@ -381,7 +430,12 @@ function formatImplementationPlan(plan: ImplementationPlan): string[] {
 interface ChangePlan {
   plans: Record<string, ImplementationPlan>;
   text: string;
+  /** Routed repos where the planner found nothing to change: left out of the ticket. */
+  dropped: string[];
 }
+
+/** A plan only counts if it changes at least one file. */
+const plansChanges = (plan: ImplementationPlan | undefined): boolean => (plan?.filesToChange ?? []).some((f) => f?.path);
 
 /**
  * Builds the change plan shown for approval: ticket, why each repo, the implementation plan
@@ -389,9 +443,10 @@ interface ChangePlan {
  */
 async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, providerName: string): Promise<ChangePlan> {
   const catalog = loadCatalog();
-  const planner = providerName === 'claude-code' ? makeClaudeCodeProvider(catalog) : undefined;
+  const planner = CLAUDE_CODE_PROVIDERS.includes(providerName) ? makeClaudeCodeProvider(catalog) : undefined;
   const hr = '─'.repeat(78);
   const plans: Record<string, ImplementationPlan> = {};
+  const dropped: string[] = [];
   const L: string[] = ['', hr, `CHANGE PLAN  ${task.id}  (for approval)`, hr];
 
   L.push(`Ticket   : ${task.title}`);
@@ -399,8 +454,11 @@ async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, pr
   L.push(`Criteria : ${task.acceptanceCriteria.length || 'none given'}`);
   task.acceptanceCriteria.forEach((c, i) => L.push(`  AC-${i + 1}. ${c}`));
 
+  const workspace = makeWorkspace();
   for (const repoId of impact.affectedRepositories) {
     const repoPath = catalog?.resolvePath(repoId) ?? path.resolve(repoRoot, repoId);
+    const isGit = await GitWorkspaceManager.isGitRepoRoot(repoPath);
+    const baseBranch = catalog?.get(repoId)?.baseBranch;
     const matched = matchedKeywords(task, repoId, catalog);
     const { header, tail } = await repoExecutionLines(
       task,
@@ -412,15 +470,32 @@ async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, pr
     L.push(...header, '');
 
     if (planner) {
-      console.log(`\n[PLANNING] Claude Code is reading ${repoId} (read-only) to draft the change plan...`);
+      // Plan against the same code the coding agent will start from: the latest base branch.
+      let snap: Awaited<ReturnType<GitWorkspaceManager['snapshot']>>;
       try {
-        const proposal = await planner.proposePlan(task, repoId, repoPath);
-        plans[repoId] = proposal.plan;
-        L.push(...formatImplementationPlan(proposal.plan));
-        L.push(`  (Drafted by Claude Code in read-only mode${proposal.stats ? `; ${proposal.stats}` : ''})`);
+        snap = isGit ? await workspace.snapshot(repoPath, baseBranch, `${task.id}-${repoId}`) : undefined;
+      } catch (err: unknown) {
+        L.push(`  Note          : could not check out the latest ${baseBranch} (${err instanceof Error ? err.message.split('\n')[0] : String(err)}); planned on the local checkout.`);
+      }
+      console.log(`\n[PLANNING] Claude Code is reading ${repoId}${snap ? ` at ${snap.ref} (${snap.commit})` : ''} (read-only) to draft the change plan...`);
+      try {
+        const proposal = await planner.proposePlan(task, repoId, snap?.dir ?? repoPath);
+        if (plansChanges(proposal.plan)) {
+          plans[repoId] = proposal.plan;
+          L.push(...formatImplementationPlan(proposal.plan));
+          L.push(`  (Drafted by Claude Code in read-only mode${snap ? ` on ${snap.ref} @ ${snap.commit}` : ''}${proposal.stats ? `; ${proposal.stats}` : ''})`);
+        } else {
+          // Routing matched, but the code says otherwise: this repo is not part of the ticket.
+          dropped.push(repoId);
+          L.push(`  NOT INCLUDED  : the planner read this repo and found nothing to change, so it is left out of this ticket.`);
+          if (proposal.plan.summary) L.push(`  Planner says  : ${proposal.plan.summary}`);
+        }
       } catch (err: unknown) {
         L.push(`  Change plan unavailable: ${err instanceof Error ? err.message : String(err)}`);
+      } finally {
+        await snap?.cleanup();
       }
+      if (dropped.includes(repoId)) continue;
     } else {
       L.push(`  Change plan   : detailed plan is drafted only with --provider claude-code (current: ${providerName})`);
     }
@@ -428,11 +503,13 @@ async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, pr
     L.push(...tail);
   }
   L.push(hr);
-  return { plans, text: L.join('\n') };
+  return { plans, text: L.join('\n'), dropped };
 }
 
 function describeProvider(providerName: string): string {
   switch (providerName) {
+    case 'coding-agent':
+      return 'Coding agent (Claude Code): tests first → implement → pipeline checks → scope gates → reviewer agent, with a fix budget';
     case 'claude-code':
       return 'Claude Code (headless) codes in a sandbox copy: tests first, then implementation; pipeline applies + verifies';
     case 'claude':
@@ -510,7 +587,7 @@ function printUsage(): void {
   npm start -- RT-123 --yes         Run without the interactive "Approve plan?" prompt
   npm start -- RT-123 --provider claude-code
                                     Full pipeline with Claude Code as the coding agent
-                                    (same as AI_PROVIDER=claude-code; providers: mock, claude, claude-code, handoff)
+                                    (same as AI_PROVIDER=claude-code; providers: mock, claude, claude-code, coding-agent, handoff)
   npm start -- --status RT-123      Show a ticket's pipeline phase (history) and saved job state
   npm start -- --sessions           List every ticket's pipeline phase
   npm start -- --unlock RT-123      Remove a stuck lock for a ticket (only if no run is active)`);
@@ -600,7 +677,7 @@ async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerN
       failures++;
       continue;
     }
-    if (providerName === 'claude-code') {
+    if (CLAUDE_CODE_PROVIDERS.includes(providerName)) {
       // Planning phase first (dedup → Planning Agent), then approval, then the coding pipeline.
       const preview = await orchestrator.plan(task);
       console.log(`\n[DEDUPLICATION] ${preview.deduplication.status.toUpperCase()}: ${preview.deduplication.reason}`);
@@ -646,12 +723,18 @@ async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerN
         failures++;
         continue;
       }
+      if (!pipelineConfig().coding.enabled) {
+        sessions.setPhase(task.id, 'approved', `CLI run: ${decision}; coding switched off`);
+        console.log(`\nPlan approved. The coding phase is switched off (coding.enabled in ${pipelineConfigPath}): no branch, code or PR.`);
+        continue;
+      }
       sessions.setPhase(task.id, 'coding', `CLI run: ${decision}`);
       task.metadata = {
         ...(task.metadata || {}),
         approvedPlans: planned.plans,
         approvedRepos: planned.repos,
-        approvedRepoDependencies: planned.repoDependencies
+        approvedRepoDependencies: planned.repoDependencies,
+        workItems: workItemsForCoding(planned.ticketPlan, task.title)
       };
       const result = await createOrchestrator(providerName, { approvePlan: async () => true }).run(task);
       sessions.setPhase(task.id, result.success ? 'done' : 'needs_human', `CLI run: ${result.status}`);
@@ -672,6 +755,11 @@ async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerN
       continue;
     }
 
+    if (!pipelineConfig().coding.enabled) {
+      console.log(`\n${task.id}: the coding phase is switched off (coding.enabled in ${pipelineConfigPath}). Use --plan to see the plan.`);
+      failures++;
+      continue;
+    }
     const result = await orchestrator.run(task);
     if (!reportResult(result)) failures++;
   }
@@ -753,9 +841,14 @@ function createWatcher(args: CliArgs, providerName: string) {
     approved: process.env.LABEL_APPROVED || DEFAULT_LABELS.approved
   };
   const project = process.env.AUTOMATION_PROJECT || 'T2';
+  // Whose tickets this watcher acts on. Default: only tickets reported by the Jira account in .env
+  // (so two people testing their own pipelines on the same project never pick up each other's tickets).
+  // AUTOMATION_REPORTER=any watches everyone's tickets; or give a Jira account id.
+  const reporter = (process.env.AUTOMATION_REPORTER || 'currentUser()').trim();
+  const reporterClause = reporter.toLowerCase() === 'any' ? '' : ` AND reporter = ${reporter === 'currentUser()' ? reporter : `"${reporter}"`}`;
   const jql =
     process.env.AUTOMATION_JQL ||
-    `project = ${project} AND labels in ("${labels.ready}", "${labels.approved}") AND statusCategory != Done ORDER BY updated ASC`;
+    `project = ${project}${reporterClause} AND labels in ("${labels.ready}", "${labels.approved}") AND statusCategory != Done ORDER BY updated ASC`;
   const store = new JobStore({ jobsDir });
   const jira = makeJira();
   const log = (m: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(m)}`);
@@ -789,7 +882,7 @@ function createWatcher(args: CliArgs, providerName: string) {
           if (preview.deduplication.status === 'duplicate') {
             return { status: 'duplicate', reason: preview.deduplication.reason, repos: [], plans: {}, text: '' };
           }
-          if (providerName === 'claude-code') {
+          if (CLAUDE_CODE_PROVIDERS.includes(providerName)) {
             // The Planning Agent chooses repos itself; keyword routing is only a hint.
             const planned = await buildTicketPlan(task, preview.impact?.affectedRepositories ?? [], providerName);
             const base = {
@@ -809,11 +902,20 @@ function createWatcher(args: CliArgs, providerName: string) {
             return { status: 'no-repo', repos: [], plans: {}, text: '' };
           }
           const changePlan = await buildChangePlan(task, preview.impact, providerName);
-          const missing = preview.impact.affectedRepositories.filter((r) => !changePlan.plans[r]);
-          if (providerName === 'claude-code' && missing.length > 0) {
+          const affected = preview.impact.affectedRepositories;
+          if (!CLAUDE_CODE_PROVIDERS.includes(providerName)) {
+            return { status: 'ready', repos: affected, plans: changePlan.plans, text: changePlan.text };
+          }
+          const missing = affected.filter((r) => !changePlan.plans[r] && !changePlan.dropped.includes(r));
+          if (missing.length > 0) {
             return { status: 'error', reason: `Claude Code could not draft a plan for: ${missing.join(', ')}`, repos: [], plans: {}, text: changePlan.text };
           }
-          return { status: 'ready', repos: preview.impact.affectedRepositories, plans: changePlan.plans, text: changePlan.text };
+          // Only repos the planner found real changes for are part of the ticket (and of the approval).
+          const repos = affected.filter((r) => changePlan.plans[r]);
+          if (repos.length === 0) {
+            return { status: 'no-repo', reason: `The planner read ${changePlan.dropped.join(', ')} and found nothing to change.`, repos: [], plans: {}, text: changePlan.text };
+          }
+          return { status: 'ready', repos, plans: changePlan.plans, text: changePlan.text };
         } catch (err) {
           const reason = err instanceof Error ? err.message : String(err);
           // Usage/rate limits and overload are temporary: keep the trigger and try again next cycle.
@@ -845,7 +947,7 @@ function createWatcher(args: CliArgs, providerName: string) {
               sourceBranch: branch.branch,
               destinationBranch: entry.baseBranch,
               title: `${task.id}: ${task.title}`,
-              description: buildPrDescription(task, result, plan, repo.repoId)
+              description: buildPrDescription(task, result, plan, repo.repoId, readCodingReport(jobsDir, result, task.id, repo.repoId))
             });
             links.push({ repoId: repo.repoId, url: pr.url, existing: pr.existing });
           }
@@ -925,7 +1027,7 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
   const { watcher, jql, labels } = createWatcher(args, providerName);
 
   console.log(`Watching Jira with: ${jql}`);
-  console.log(`AI: ${providerName} | approval: ${process.env.AUTO_APPROVE_PLAN === 'true' ? 'AUTO (no human gate)' : `label "${labels.approved}"`}${args.dryRun ? ' | DRY RUN (no Jira writes, no AI runs)' : ''}`);
+  console.log(`AI: ${providerName} | start: label "${labels.ready}" | approval: ${process.env.AUTO_APPROVE_PLAN === 'true' ? 'AUTO (no human gate)' : `label "${labels.approved}"`} | coding: ${pipelineConfig().coding.enabled ? 'on' : 'OFF (config/pipeline.yaml coding.enabled)'}${args.dryRun ? ' | DRY RUN (no Jira writes, no AI runs)' : ''}`);
   try {
     if (args.once || args.dryRun) {
       const report = await watcher.runOnce();
@@ -1022,7 +1124,7 @@ async function main() {
   console.log('='.repeat(60));
 
   // --provider on the command line wins over AI_PROVIDER in the environment / .env
-  const providerName = (args.provider || process.env.AI_PROVIDER || 'claude-code').toLowerCase();
+  const providerName = (args.provider || process.env.AI_PROVIDER || 'coding-agent').toLowerCase();
   console.log(`Active AI Provider: ${providerName.toUpperCase()}`);
   console.log(`Repositories Path:  ${repoRoot}`);
   console.log('='.repeat(60));
