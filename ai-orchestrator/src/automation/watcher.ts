@@ -396,9 +396,12 @@ export class AutomationWatcher {
       task.metadata = { ...(task.metadata || {}), previousQuestions: questionState.questions };
     }
     const clear = [L.ready];
-    // A plan that was posted but not approved: re-plan using the reviewer's comments.
+    // A plan already exists: re-plan from it using the reviewer's comments. If it was approved,
+    // "ai-ready" withdraws that approval (rejected after approval, or product changed direction);
+    // the approved version is kept on disk with its approval record.
     const prior = this.readPlan(task.id);
-    const revising = !!(prior?.ticketPlan && !prior.approvedAt);
+    const revising = !!prior?.ticketPlan;
+    const reopening = revising && !!prior!.approvedAt;
     const version = revising ? (prior!.version ?? 1) + 1 : 1;
     const maxRevisions = this.config.maxPlanRevisions ?? 3;
     if (revising && version > maxRevisions + 1) {
@@ -416,6 +419,13 @@ export class AutomationWatcher {
       if (!this.config.dryRun) {
         const dir = path.dirname(this.planFile(task.id));
         fs.copyFileSync(this.planFile(task.id), path.join(dir, `plan.v${prior!.version ?? 1}.json`));
+      }
+      if (reopening && !this.config.dryRun) {
+        this.deps.log(`${task.id}: approved plan v${prior!.version ?? 1} reopened → re-planning`);
+        await this.comment(task.id, [
+          `Approval of change plan v${prior!.version ?? 1} (approved by ${prior!.approvedBy ?? 'unknown'} at ${prior!.approvedAt}) is withdrawn because "${L.ready}" was added again.`,
+          `Re-planning from the newest comments. The approved version is kept for comparison.`
+        ]);
       }
     }
     const outcome = await this.deps.plan(task);

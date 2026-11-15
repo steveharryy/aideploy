@@ -265,3 +265,41 @@ describe('coding phase switch', () => {
     expect(loadPipelineConfig(path.join(__dirname, '..', 'config', 'pipeline.yaml')).coding.enabled).toBe(false);
   });
 });
+
+describe('rejecting an approved plan', () => {
+  it('ai-ready on an approved plan: approval withdrawn, approved version kept, agent gets the old plan', async () => {
+    const comments: string[] = [];
+    let seenPrevious: unknown;
+    const jobsDir = fs.mkdtempSync(path.join(tmp, 'reopen-'));
+    fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
+    const approved = { ticketId: 'T2-1', version: 2, text: 'P2', repos: [], plans: {}, ticketPlan: { ticket: 'T2-1', summary: 'old approach' }, approvedBy: 'Abhay', approvedAt: '2026-11-15T13:41:43.749Z' };
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify(approved));
+    const w = new AutomationWatcher(
+      { jql: 'x', labels: L, autoApprove: false, maxAttempts: 3, dryRun: false, codingEnabled: () => false },
+      {
+        jira: {
+          searchTasks: async () => [ticket('T2-1', [L.ready])],
+          getTask: async () => ticket('T2-1', [L.ready]),
+          addComment: async (_k, lines) => void comments.push(lines.join(' ')),
+          updateLabels: async () => {},
+          transition: async () => true,
+          getLabelAdder: async () => 'x'
+        },
+        jobsDir,
+        log: () => {},
+        attempts: () => 0,
+        plan: async (t) => { seenPrevious = t.metadata?.previousPlan; return { status: 'ready', repos: [], plans: {}, text: 'P3' }; },
+        implement: async () => { throw new Error('no'); },
+        publish: async () => ({ links: [], skipped: [] })
+      }
+    );
+    await w.runOnce();
+    expect(comments.join(' ')).toMatch(/Approval of change plan v2 \(approved by Abhay.*withdrawn/);
+    expect(seenPrevious).toMatchObject({ summary: 'old approach' });
+    const kept = JSON.parse(fs.readFileSync(path.join(jobsDir, 'T2-1', 'plan.v2.json'), 'utf-8'));
+    expect(kept.approvedBy).toBe('Abhay');
+    const current = JSON.parse(fs.readFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), 'utf-8'));
+    expect(current.approvedAt).toBeUndefined();
+    expect(w.sessions.get('T2-1')?.phase).toBe('plan_review');
+  });
+});

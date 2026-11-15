@@ -359,7 +359,7 @@ Finish with submit_plan (always, whatever you found).`;
       .map((t) => `  ${t.key} [${t.status ?? '-'}] ${t.title}${t.description ? `\n    ${t.description.slice(0, 400).replace(/\s+/g, ' ')}` : ''}`)
       .join('\n');
     const revision = request.previousPlan
-      ? `\n<previous_plan>\nAn earlier plan for this ticket was NOT approved. Revise it using the reviewer's notes in the comments (newest first matters most). Keep what was not criticised; say what you changed in "assumptions" or "clarifications".\n${JSON.stringify(request.previousPlan, null, 2).slice(0, 12000)}\n</previous_plan>\n`
+      ? `\n<previous_plan>\nAn earlier plan for this ticket is being replaced: it was not approved, or its approval was withdrawn. Revise it using the reviewer's notes in the comments (newest first matters most). Keep what was not criticised. If the notes reject the approach or give a different solution, follow the new direction and drop what it replaces, including earlier decisions the notes reverse. Say what you changed in "assumptions" or "clarifications".\n${JSON.stringify(request.previousPlan, null, 2).slice(0, 12000)}\n</previous_plan>\n`
       : '';
     const previous = request.previousQuestions?.length
       ? `\n<previous_questions>\nThese questions were asked earlier. The answers should be in the comments above. Use them; do not ask again what was answered.\n${request.previousQuestions
