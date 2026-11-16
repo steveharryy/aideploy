@@ -56,7 +56,7 @@ export abstract class BaseRepoAgent implements IRepoAgent {
       });
 
       // 4. Apply changes within repository boundary
-      const appliedFiles = await this.applyFileChanges(aiResponse.fileChanges);
+      const appliedFiles = await this.applyFileChanges(aiResponse.fileChanges, approvedBaselineFixFiles(task, this.repoId));
 
       return {
         repoId: this.repoId,
@@ -130,7 +130,7 @@ export abstract class BaseRepoAgent implements IRepoAgent {
     return snapshots;
   }
 
-  private async applyFileChanges(changes: FileChange[]): Promise<string[]> {
+  private async applyFileChanges(changes: FileChange[], approvedTestRepair: Set<string> = new Set()): Promise<string[]> {
     const repoRoot = path.resolve(this.repoPath);
 
     // Validate every path BEFORE writing anything, so one bad path can't leave a half-applied change set.
@@ -150,8 +150,11 @@ export abstract class BaseRepoAgent implements IRepoAgent {
       return { change, targetPath };
     });
 
-    // Test integrity (design rule 7): never delete, skip or weaken existing tests.
-    const violations = await checkTestIntegrity(changes, async (relPath) => {
+    // Test integrity (design rule 7): never delete, skip or weaken existing tests. The only exception
+    // is a file the APPROVED plan lists in this repo's baseline fix (repairing tests that were
+    // already broken on the base branch); the coding agent has already limited and verified those.
+    const checked = changes.filter((c) => !approvedTestRepair.has(c.path));
+    const violations = await checkTestIntegrity(checked, async (relPath) => {
       try {
         return await fs.readFile(path.resolve(repoRoot, relPath), 'utf-8');
       } catch {
@@ -184,3 +187,10 @@ export abstract class BaseRepoAgent implements IRepoAgent {
   }
 }
 
+
+/** Files the approved plan allows to change for this repo's baseline fix (task.metadata.workItems). */
+export function approvedBaselineFixFiles(task: TaskInput, repoId: string): Set<string> {
+  const items = (task.metadata?.workItems as Array<{ repo?: string; baselineFix?: { files?: unknown } }> | undefined) ?? [];
+  const files = items.find((w) => w.repo === repoId)?.baselineFix?.files;
+  return new Set(Array.isArray(files) ? files.filter((f): f is string => typeof f === 'string') : []);
+}

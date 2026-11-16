@@ -224,6 +224,23 @@ describe('Test integrity guard', () => {
     await expect(fs.access(path.join(repo, 'src', 'fix.ts'))).rejects.toThrow();
     await expect(fs.access(path.join(repo, 'tests', 'a.test.ts'))).resolves.toBeUndefined();
   });
+
+  it('the approved baseline fix may narrow only its listed test file; every other test file is still checked', async () => {
+    const repo = path.join(tmp, 'baseline-fix-repo');
+    await fs.mkdir(path.join(repo, 'tests'), { recursive: true });
+    await fs.writeFile(path.join(repo, 'tests', 'a.test.ts'), original['tests/a.test.ts']);
+    await fs.writeFile(path.join(repo, 'tests', 'b.test.ts'), original['tests/a.test.ts']);
+    const todo = (p: string): FileChange => ({ path: p, action: 'modify', content: original['tests/a.test.ts'] + "it.todo('restore');\n" });
+    const withFix = (changes: FileChange[]) => {
+      const t = task('T-2');
+      t.metadata = { ...(t.metadata || {}), workItems: [{ repo: 'repo-a', baselineFix: { files: ['tests/a.test.ts'], reason: 'empty suite' } }] };
+      return new RepoAgent('repo-a', repo, new MockAIProvider(async () => ({ providerName: 'mock', reasoning: '', fileChanges: changes }))).execute(t);
+    };
+    expect((await withFix([todo('tests/a.test.ts')])).success).toBe(true); // approved file
+    const other = await withFix([todo('tests/b.test.ts')]); // not in the approved fix
+    expect(other.success).toBe(false);
+    expect(other.error).toMatch(/Test integrity violation/);
+  });
 });
 
 describe('Verify contract', () => {
