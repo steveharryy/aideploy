@@ -77,7 +77,7 @@ export interface PlanCommentMeta {
   promptVersion?: string;
   costUsd?: number;
   /** Per-repo facts: branch, verify commands, rollback. */
-  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }>;
+  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string; readAt?: string }>;
 }
 
 // ── plan for review ────────────────────────────────────────────────────────────────────────
@@ -221,8 +221,8 @@ export function planCommentAdf(plan: TicketPlan, meta: PlanCommentMeta): AdfNode
     C.push(heading(3, 'How it will be done after approval'));
     C.push(
       table(
-        ['Repository', 'Branch', 'Verify steps', 'Rollback'],
-        meta.repoFacts.map((f) => [[code(f.repo)], f.branch ? [code(f.branch)] : '-', f.verify ? [code(f.verify)] : '-', f.rollback || '-'])
+        ['Repository', 'Planned on', 'Branch', 'Verify steps', 'Rollback'],
+        meta.repoFacts.map((f) => [[code(f.repo)], f.readAt ? [code(f.readAt)] : '-', f.branch ? [code(f.branch)] : '-', f.verify ? [code(f.verify)] : '-', f.rollback || '-'])
       )
     );
   }

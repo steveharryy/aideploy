@@ -456,3 +456,14 @@ describe('Claude usage limit during coding', () => {
     expect(implemented).toBe(2);
   });
 });
+
+describe('plan comment shows which code was read', () => {
+  it('the "How it will be done" table has a Planned on column', async () => {
+    const { planCommentAdf } = await import('../src/agents/planning/render-adf.js');
+    const { normalizePlan } = await import('../src/agents/planning/plan-rules.js');
+    const plan = normalizePlan({ readiness: 'ready', workItems: [{ id: 'W1', repo: 'api', task: 't' }], acceptanceCriteria: [{ id: 'AC1', text: 'x', verify: 'unit_test' }] }, 'T2-1');
+    const json = JSON.stringify(planCommentAdf(plan, { version: 1, readyLabel: 'ai-ready', approvedLabel: 'ai-approved', repoFacts: [{ repo: 'api', readAt: 'PRE @ fbf2933', branch: 'ai/t2-1' }] }));
+    expect(json).toContain('Planned on');
+    expect(json).toContain('PRE @ fbf2933');
+  });
+});

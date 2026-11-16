@@ -37,7 +37,7 @@ ai-orchestrator/
 │   ├── jobs/                  session store (phases), job store, locks
 │   ├── providers/             AI providers: coding-agent, claude-code, claude, handoff, mock
 │   ├── code.ts                CLI for the coding agent alone: npm run code -- --work-item <file>
-│   └── workspace/             git worktree per ticket
+│   └── workspace/             git worktree per ticket; repo-sync.ts keeps .repos clones on the latest base branch for planning
 ├── docs/CODING_AGENT.md       how the coding agent works (gates, review, report)
 ├── tests/                     vitest suites; tests/fixtures/sample-catalog.yaml for the demo repos
 └── repositories/              sample repos repo-a/b/c, used only by tests, QA and --demo
@@ -54,7 +54,7 @@ npm run typecheck
 
 ## Adding a repo
 
-1. Clone it into `.repos/<name>` on its base branch.
+1. Clone it into `.repos/<name>` (any branch: before every planning run the pipeline fetches `baseBranch` and moves the clone to `origin/<baseBranch>`; only folders inside `.repos` are ever touched).
 2. Add it to `catalog/repos.yaml`: `id`, `name`, `purpose`, `path: ../.repos/<name>`, `baseBranch`, `bitbucket`, `keywords`, `verify` (start with the install step).
 3. Map its Jira components or area labels in `config/components.yaml`, with a `risk_floor` (`high` for money).
 4. Run `npm test`: a test checks that both config files load and agree with the catalog.

@@ -73,7 +73,7 @@ export interface PlanOutcome {
   promptVersion?: string;
   costUsd?: number;
   /** Per-repo branch / verify / rollback, for the plan comment. */
-  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }>;
+  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string; readAt?: string }>;
 }
 
 export interface PullRequestLink {

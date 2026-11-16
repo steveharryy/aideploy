@@ -19,6 +19,7 @@ import type { PlanQuestion, TicketPlan } from './agents/planning/types.js';
 import { CodingAgentProvider } from './providers/coding-agent-provider.js';
 import type { CodingReport } from './agents/coding/coding-agent.js';
 import { JiraClient } from './integrations/jira/jira-client.js';
+import { describeSync, syncPlanningClones, type RepoSyncResult } from './workspace/repo-sync.js';
 import { ServiceCatalog } from './catalog/service-catalog.js';
 import { ComponentMap } from './catalog/component-map.js';
 import { intakeFor, killSwitchOn, loadPipelineConfig, type PipelineConfig } from './config/pipeline-config.js';
@@ -192,6 +193,19 @@ function makeClaudeCodeProvider(catalog: ServiceCatalog | undefined): ClaudeCode
   });
 }
 
+/** The pipeline's own clones (catalog paths ../.repos/<repo>); nothing outside it is ever fetched or reset. */
+const planningClonesRoot = path.resolve(process.env.PLANNING_CLONES_DIR || path.resolve(__dirname, '..', '.repos'));
+
+/** Brings every catalog repo's clone to the latest origin/<baseBranch> before planning (see workspace/repo-sync.ts). */
+async function syncCatalogClones(catalog: ServiceCatalog): Promise<RepoSyncResult[]> {
+  const results = await syncPlanningClones(
+    catalog.repos.map((r) => ({ id: r.id, path: catalog.resolvePath(r.id), baseBranch: r.baseBranch })),
+    { clonesRoot: planningClonesRoot, remoteEnv: () => new BitbucketClient().gitRemoteEnv() }
+  );
+  console.log(`\n[PLANNING] Repositories updated to the latest base branch:\n${results.map((r) => `  ${describeSync(r)}`).join('\n')}`);
+  return results;
+}
+
 function makePlanningAgent(catalog: ServiceCatalog | undefined, cfg: PipelineConfig, componentMap: ComponentMap | undefined): PlanningAgent {
   const repos: PlannerRepo[] = catalog
     ? catalog.repos.map((r) => ({
@@ -304,7 +318,7 @@ interface TicketPlanResult {
   costUsd?: number;
   engine?: string;
   toolCalls?: unknown[];
-  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }>;
+  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string; readAt?: string }>;
 }
 
 /**
@@ -323,6 +337,9 @@ async function buildTicketPlan(task: TaskInput, candidateRepos: string[], provid
     console.log('\n[PLANNING] Gathering context: linked documents and similar past tickets...');
     task = await makeJira().enrichForPlanning(task);
   }
+  // Plan on the same code the coding agent will start from: the latest base branch (PRE).
+  const synced = catalog ? await syncCatalogClones(catalog) : [];
+  const readAt = new Map(synced.filter((s) => s.commit).map((s) => [s.repo, `${s.ref ?? '?'} @ ${s.commit}${s.fresh ? '' : ' (not updated)'}`]));
   console.log('\n[PLANNING] Planning Agent is reading the ticket and the repositories (read-only)...');
   const result = await makePlanningAgent(catalog, cfg, componentMap).plan(task, {
     // Component map first, keyword routing only as a fallback.
@@ -337,6 +354,10 @@ async function buildTicketPlan(task: TaskInput, candidateRepos: string[], provid
     previousPlan: task.metadata?.previousPlan as TicketPlan | undefined
   });
   const plan = result.plan;
+  // A repo in the plan that could not be updated was read at an older commit: the approver must know.
+  for (const r of synced.filter((s) => !s.fresh && !s.skipped && plan.workItems.some((w) => w.repo === s.repo))) {
+    plan.warnings.push(`${r.repo} was planned on an older copy (${r.commit ?? '?'}): the latest ${r.ref} could not be fetched (${r.error ?? 'unknown error'}). Re-plan once the fetch works.`);
+  }
   const status: TicketPlanStatus =
     // Problems first: an incomplete gap analysis means the verdict itself cannot be trusted.
     result.problems.length ? 'invalid' : plan.readiness === 'blocking' ? 'needs-input' : plan.readiness === 'too_vague' ? 'needs-info' : 'ready';
@@ -363,6 +384,7 @@ async function buildTicketPlan(task: TaskInput, candidateRepos: string[], provid
       const verify = catalog?.verifyCommands(item.repo).map((v) => v.run) ?? [];
       repoFacts.push({
         repo: item.repo,
+        ...(readAt.get(item.repo) ? { readAt: readAt.get(item.repo) } : {}),
         ...(isGit ? { branch } : {}),
         verify: verify.length ? verify.join(' → ') : 'make verify / npm test',
         rollback: isGit ? `delete branch ${branch} and its worktree` : 'restore the folder from a copy (not a git clone)'

@@ -43,7 +43,7 @@ Intake ──── plain code, no AI cost: description, issue type, size (+ pro
    ▼
 Planning agent ─── Claude Code with all built-in tools OFF, only 5 guarded tools:
    │                 jira_read · list_repos · search_code · read_file · submit_plan
-   │                 reads the real repos (pipeline-owned clones on PRE)
+   │                 reads the real repos (pipeline-owned clones, fetched to the latest PRE before every plan)
    ▼
 Decision (code, not the AI)
    ├─ expected behaviour or product/repo missing  → comment: what is missing   (needs_info)
