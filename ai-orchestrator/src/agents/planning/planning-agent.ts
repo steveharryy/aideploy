@@ -1,3 +1,4 @@
+import { CLI_LIMIT_BANNER, TEMPORARY_CLI_FAILURE } from '../../util/claude-limits.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -548,7 +549,3 @@ export class PlanningRunError extends Error {
   }
 }
 
-/** Claude Code error results that go away on their own. Checked only on the CLI's error result. */
-const TEMPORARY_CLI_FAILURE = /usage limit|session limit|rate.?limit|too many requests|\b429\b|overloaded|\b529\b|try again later/i;
-/** The CLI's usage-limit banner returned as the entire answer (e.g. "You've hit your session limit · resets 8pm"). */
-const CLI_LIMIT_BANNER = /^(you'?ve hit your (session|usage|weekly|daily) limit|claude ai usage limit reached)\b.{0,120}$/i;

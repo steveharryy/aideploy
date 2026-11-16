@@ -8,6 +8,7 @@ import { missingInfoCommentAdf, planCommentAdf, questionsCommentAdf, type AdfNod
 import { FileSessionStore, type SessionPhase, type SessionStore } from '../jobs/session-store.js';
 import { redactSecrets, safeErrorMessage } from '../util/redact.js';
 import { workItemsForCoding } from '../agents/planning/plan-rules.js';
+import { isTemporaryClaudeFailure, limitResetHint } from '../util/claude-limits.js';
 import type { CodingReport } from '../agents/coding/coding-agent.js';
 
 /**
@@ -600,7 +601,9 @@ export class AutomationWatcher {
       return 'skipped';
     }
 
-    const attempts = this.deps.attempts(task.id);
+    // Runs paused by a temporary Claude limit are not attempts.
+    const paused = (this.sessions.get(task.id)?.history ?? []).filter((h) => h.detail?.startsWith('coding paused (temporary)')).length;
+    const attempts = Math.max(0, this.deps.attempts(task.id) - paused);
     if (attempts >= this.config.maxAttempts) {
       this.deps.log(`${task.id}: retry limit reached (${attempts}/${this.config.maxAttempts})`);
       if (this.config.dryRun) return 'retry-limit';
@@ -646,6 +649,19 @@ export class AutomationWatcher {
     const verify = (result.testingResult?.repoResults ?? []).flatMap((r) =>
       r.checks.filter((c) => c.name !== 'directory-exists').map((c) => `${r.repoId} ${c.name}: ${c.passed ? 'passed' : 'FAILED'}`)
     );
+
+    if (!result.success && isTemporaryClaudeFailure(result.error)) {
+      // A Claude usage/rate limit is not a failed attempt: nothing was pushed, the plan stays approved.
+      // Paused (not auto-retried: each retry re-runs install/build/test before reaching Claude).
+      const reset = limitResetHint(result.error);
+      this.deps.log(`${task.id}: coding paused, Claude limit reached${reset ? ` (${reset})` : ''}; attempt not counted`);
+      await this.comment(task.id, [
+        `Implementation paused: the Claude usage limit was reached${reset ? ` (${reset})` : ''}. Nothing was pushed; the approved plan is unchanged.`,
+        `This does not count as a failed attempt. Add the label "${L.approved}" again after the limit resets.`
+      ]);
+      await this.toPhase(task.id, 'approved', [], `coding paused (temporary): ${redactSecrets(result.error ?? '').slice(0, 160)}`);
+      return 'skipped';
+    }
 
     if (!result.success) {
       const failedCheck = (result.testingResult?.repoResults ?? [])

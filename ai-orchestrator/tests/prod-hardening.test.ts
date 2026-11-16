@@ -403,3 +403,56 @@ describe('Jira comment size', () => {
     expect(json).toContain('(truncated)');
   });
 });
+
+describe('Claude usage limit during coding', () => {
+  const limitError = "Failed at Code Modification: [api]: Coding agent T2-1 W1 [api]: FAILED — Claude Code call failed (success): You've hit your 5-hour limit · resets 10:40pm (Asia/Calcutta)";
+
+  it('recognises the limit wordings (5-hour, session, usage) but not ordinary failures', async () => {
+    const { isTemporaryClaudeFailure, CLI_LIMIT_BANNER, limitResetHint } = await import('../src/util/claude-limits.js');
+    expect(isTemporaryClaudeFailure(limitError)).toBe(true);
+    expect(CLI_LIMIT_BANNER.test("You've hit your 5-hour limit · resets 10:40pm (Asia/Calcutta)")).toBe(true);
+    expect(CLI_LIMIT_BANNER.test("You've hit your session limit · resets 8pm")).toBe(true);
+    expect(isTemporaryClaudeFailure('Tests failed: expected 3, received -1')).toBe(false);
+    expect(limitResetHint(limitError)).toBe('resets 10:40pm (Asia/Calcutta)');
+  });
+
+  it('pauses the ticket (phase approved, comment), does not count the attempt, and a later run is allowed', async () => {
+    const comments: string[] = [];
+    let implemented = 0;
+    const jobsDir = fs.mkdtempSync(path.join(tmp, 'limit-'));
+    fs.mkdirSync(path.join(jobsDir, 'T2-1'), { recursive: true });
+    fs.writeFileSync(path.join(jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticketId: 'T2-1', version: 1, text: 'P', repos: ['api'], plans: {}, approvedBy: 'A', approvedAt: '2026-11-15T00:00:00Z' }));
+    let attemptsSoFar = 2;
+    const w = new AutomationWatcher(
+      { jql: 'x', labels: L, autoApprove: false, maxAttempts: 3, dryRun: false, codingEnabled: () => true },
+      {
+        jira: {
+          searchTasks: async () => [ticket('T2-1', [L.approved])],
+          getTask: async () => ticket('T2-1', [L.approved]),
+          addComment: async (_k, lines) => void comments.push(lines.join(' ')),
+          updateLabels: async () => {},
+          transition: async () => true,
+          getLabelAdder: async () => 'x'
+        },
+        jobsDir,
+        log: () => {},
+        attempts: () => attemptsSoFar,
+        plan: async () => { throw new Error('no'); },
+        implement: async () => {
+          implemented++;
+          attemptsSoFar++; // the job store counts every run
+          return { taskId: 'T2-1', success: false, status: 'EXECUTION_FAILED', error: limitError } as never;
+        },
+        publish: async () => ({ links: [], skipped: [] })
+      }
+    );
+    const r = await w.runOnce();
+    expect(r.actions[0].action).toBe('skipped');
+    expect(w.sessions.get('T2-1')?.phase).toBe('approved');
+    expect(comments.join(' ')).toMatch(/paused: the Claude usage limit was reached \(resets 10:40pm/);
+    expect(comments.join(' ')).toMatch(/does not count as a failed attempt/);
+    // 3 runs recorded, 1 of them paused → 2 attempts used → the next approval still runs.
+    await w.runOnce();
+    expect(implemented).toBe(2);
+  });
+});
