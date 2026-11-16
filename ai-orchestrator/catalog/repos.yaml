@@ -2,11 +2,13 @@
 #
 # Repos are the pipeline's own clean clones in ai-orchestrator/.repos/<repo> (gitignored),
 # on baseBranch. Developers' working copies (e.g. ~/Work/<repo>) are never read or touched.
-# Refresh before a planning run:  git -C .repos/<repo> pull --ff-only
+# No manual refresh: before every planning run the pipeline fetches baseBranch and moves each clone
+# to origin/<baseBranch> (src/workspace/repo-sync.ts). Coding cuts ai/<ticket> from the same branch.
 #
 # Fields per repo:
 #   id          unique id (used by plans and the component map)
-#   path        absolute, or relative to REPOSITORIES_ROOT (default: ai-orchestrator/repositories)
+#   path        absolute, or relative to REPOSITORIES_ROOT (default: ai-orchestrator/repositories),
+#               so ../.repos/<repo> = ai-orchestrator/.repos/<repo>
 #   baseBranch  the branch planning reads and ticket branches start from (team decision: PRE, the integration branch; gb-bo-admin-fe uses lower-case "pre")
 #   bitbucket   where pull requests are opened
 #   keywords    whole-word hints for routing (the Planning Agent confirms in the code)
