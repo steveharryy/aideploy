@@ -329,8 +329,10 @@ describe('CodingAgent (points 4–9)', () => {
       expect(report.status).toBe('ready_for_pr');
       expect(calls[0].phase).toBe('baseline');
       expect(report.baselineFix).toEqual({ reason: baselineFix.reason, files: ['tests/existing.test.ts', 'tsconfig.test.json'], reverted: ['src/other.ts'] });
-      // Only the approved fix used a round: its it.todo is not reported as the agent weakening tests.
+      // The approved fix is logged but has its own budget: no feature fix round was used,
+      // and its it.todo is not reported as the agent weakening tests.
       expect(report.fixRounds.map((f) => f.phase)).toEqual(['baseline-fix']);
+      expect(report.iterationsUsed).toBe(0);
       expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts', 'tests/existing.test.ts', 'tsconfig.test.json']);
       expect(report.testsFirst).toMatchObject({ baselinePassed: true, failedBeforeChange: true });
     });
@@ -537,5 +539,18 @@ describe('CodingAgent model selection', () => {
     const modelOf = (c: { args: string[] }) => c.args[c.args.indexOf('--model') + 1];
     expect(calls.filter((c) => c.phase !== 'review').map(modelOf)).toEqual(['sonnet', 'sonnet']);
     expect(modelOf(calls.find((c) => c.phase === 'review')!)).toBe('opus');
+  });
+});
+
+describe('planned paths with placeholders', () => {
+  it('sql/<date>_x.sql and src/*.ts match the real file names, but not other folders', async () => {
+    const { outOfPlanFiles, plannedPathMatcher } = await import('../src/agents/coding/gates.js');
+    const ch = (p: string): TreeChange => ({ path: p, action: 'create', after: 'x' });
+    const planned = [{ path: 'sql/<date>_withdrawal_notifications.sql' }, { path: 'src/utils/*.ts' }, { path: 'src/a.ts' }];
+    expect(outOfPlanFiles([ch('sql/2026-11-16_withdrawal_notifications.sql'), ch('src/utils/formatLkr.ts'), ch('src/a.ts')], planned)).toEqual([]);
+    expect(outOfPlanFiles([ch('sql/x/2026_withdrawal_notifications.sql'), ch('src/utils/deep/x.ts'), ch('src/b.ts')], planned)).toEqual([
+      'sql/x/2026_withdrawal_notifications.sql', 'src/utils/deep/x.ts', 'src/b.ts'
+    ]);
+    expect(plannedPathMatcher('src/a.(b).ts')('src/a.(b).ts')).toBe(true); // regex characters are literal
   });
 });

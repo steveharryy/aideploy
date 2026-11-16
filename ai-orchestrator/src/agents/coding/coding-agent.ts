@@ -327,7 +327,8 @@ export class CodingAgent {
       const reverted: string[] = [];
       let log = redLog;
       for (let attempt = 0; attempt < 2; attempt++) {
-        spendIteration([`baseline fix: existing tests fail before any change (${fix.reason})`], 'baseline-fix');
+        // Own budget (2 tries), not the feature's fix rounds: the repair is approved work, not a mistake.
+        report.fixRounds.push({ round: attempt + 1, phase: 'baseline-fix', problems: [`existing tests fail before any change (${fix.reason})`.split('\n')[0]] });
         this.log(`[${w.repo}] phase 0: repairing the test baseline (approved in the plan: ${[...allowed].join(', ')})`);
         absorb(await callCoder(baselineFixPrompt(w, [...allowed], fix.reason, log, testStep!.run)));
         for (const d of diffTrees(before, await snapshot())) {

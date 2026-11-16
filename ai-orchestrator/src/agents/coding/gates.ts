@@ -186,8 +186,20 @@ export function isAuxiliaryFile(p: string): boolean {
 /** Changed source files that the plan did not list (each needs a reason). */
 export function outOfPlanFiles(changes: TreeChange[], planned?: Array<{ path: string }>): string[] {
   if (!planned || planned.length === 0) return [];
-  const allowed = new Set(planned.map((f) => f.path.replace(/^\.\//, '')));
-  return changes.map((c) => c.path).filter((p) => !allowed.has(p) && !isTestFile(p) && !isAuxiliaryFile(p));
+  const matchers = planned.map((f) => plannedPathMatcher(f.path.replace(/^\.\//, '')));
+  return changes.map((c) => c.path).filter((p) => !matchers.some((m) => m(p)) && !isTestFile(p) && !isAuxiliaryFile(p));
+}
+
+/**
+ * A planned path may hold placeholders the planner cannot know yet, e.g. "sql/<date>_x.sql" or
+ * "src/*.ts": each <placeholder> or * matches one path segment's worth of characters (no "/").
+ */
+export function plannedPathMatcher(planned: string): (p: string) => boolean {
+  if (!/[<*]/.test(planned)) return (p) => p === planned;
+  const re = new RegExp(
+    '^' + planned.split(/(<[^>/]*>|\*)/).map((part) => (part.startsWith('<') || part === '*' ? '[^/]+' : part.replace(/[.+?^${}()|[\]\\]/g, '\\$&'))).join('') + '$'
+  );
+  return (p) => re.test(p);
 }
 
 // ── Acceptance-criteria test coverage ───────────────────────────────────────

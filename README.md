@@ -168,7 +168,7 @@ There is no Slack integration; Jira is the only channel.
 | `ai-orchestrator/config/pipeline.yaml` | Kill switch, prompt version, planning limits, intake rules (default and per project), Jira field IDs, phase → Jira status mapping. Read fresh before every step, so changes apply without a restart |
 | `ai-orchestrator/config/components.yaml` | Jira component **or label** → repos, product and `risk_floor`. The first thing used to pick repos |
 | `ai-orchestrator/catalog/repos.yaml` | Every repo the pipeline may touch: path, base branch, Bitbucket slug, routing keywords, verify commands |
-| `ai-orchestrator/prompts/planning-v3.md` | The planning agent's instructions, versioned in Git. Change it by adding `planning-v4.md` and setting `prompt_version` |
+| `ai-orchestrator/prompts/planning-v4.md` | The planning agent's instructions, versioned in Git. Change it by adding `planning-v5.md` and setting `prompt_version` |
 
 Current settings for **T2**: no Product or component required, issue types Story, Task and Bug, at most 3 story points. Moving tickets through Jira workflow statuses per phase is mapped in `pipeline.yaml` but **off** (`move_status: false`) until the mapping is agreed.
 
