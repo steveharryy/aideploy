@@ -10,7 +10,7 @@ import { DeduplicationAgent } from '../src/agents/deduplication/agent.js';
 import { ImpactAnalysisAgent } from '../src/agents/impact-analysis/agent.js';
 import { TeamAgent } from '../src/agents/team-agent/team-agent.js';
 import { TestingAgent } from '../src/agents/testing/agent.js';
-import { RepoAgentA } from '../src/agents/team-agent/team-agent.js';
+import { RepoAgent } from '../src/agents/team-agent/team-agent.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const sourceRepoRoot = path.resolve(__dirname, '../repositories');
@@ -141,7 +141,7 @@ describe('AI Orchestrator Pipeline', () => {
   });
 
   it('3b. should handle repository not found error gracefully', async () => {
-    const repoAgent = new RepoAgentA(new MockAIProvider(), '/tmp/nonexistent-repo-path-12345');
+    const repoAgent = new RepoAgent('repo-a', '/tmp/nonexistent-repo-path-12345', new MockAIProvider());
     const result = await repoAgent.execute(sampleTask);
 
     expect(result.success).toBe(false);
@@ -414,7 +414,7 @@ describe('AI Orchestrator Pipeline', () => {
     expect(repoBResult?.reasoning).toContain('Skipped due to upstream repository failure');
   });
 
-  it('10. should instantiate and coordinate RepoAgentA, RepoAgentB, and RepoAgentC', async () => {
+  it('10. should instantiate and coordinate one RepoAgent per repository', async () => {
     const teamAgent = new TeamAgent(new MockAIProvider(), {
       repositoriesRoot: testRepoRoot
     });

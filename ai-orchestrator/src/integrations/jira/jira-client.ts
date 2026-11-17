@@ -7,8 +7,18 @@ export interface JiraClientConfig {
   apiToken?: string;
   /** Optional custom field holding acceptance criteria, e.g. customfield_10042. */
   acceptanceCriteriaField?: string;
+  /** "Product" select field (e.g. customfield_10224) → metadata.product. */
+  productField?: string;
+  /** Story points field (e.g. customfield_10070) → metadata.storyPoints. */
+  storyPointsField?: string;
   /** Inject fetch (used by tests). */
   fetchImpl?: typeof fetch;
+  /** Per-request timeout in ms (default 30 s). */
+  timeoutMs?: number;
+  /** Attempts per request, including the first (default 4). */
+  maxAttempts?: number;
+  /** Inject the wait between retries (used by tests). */
+  sleep?: (ms: number) => Promise<void>;
 }
 
 /** Minimal Atlassian Document Format node. */
@@ -32,6 +42,13 @@ interface JiraIssue {
     comment?: {
       comments?: Array<{ author?: { displayName?: string }; created?: string; body?: AdfNode | string }>;
     };
+    parent?: { key: string; fields?: { summary?: string } };
+    issuelinks?: Array<{
+      type?: { inward?: string; outward?: string };
+      inwardIssue?: { key: string; fields?: { summary?: string; status?: { name?: string } } };
+      outwardIssue?: { key: string; fields?: { summary?: string; status?: { name?: string } } };
+    }>;
+    reporter?: { displayName?: string; accountId?: string };
     [field: string]: unknown;
   };
 }
@@ -46,7 +63,12 @@ export class JiraClient {
   private baseUrl: string;
   private authHeader: string;
   private acField?: string;
+  private productField?: string;
+  private storyPointsField?: string;
   private fetchImpl: typeof fetch;
+  private timeoutMs: number;
+  private maxAttempts: number;
+  private sleep: (ms: number) => Promise<void>;
 
   constructor(config: JiraClientConfig = {}) {
     const baseUrl = config.baseUrl || process.env.JIRA_BASE_URL;
@@ -65,12 +87,17 @@ export class JiraClient {
     this.baseUrl = baseUrl!.replace(/\/+$/, '');
     this.authHeader = 'Basic ' + Buffer.from(`${email}:${apiToken}`).toString('base64');
     this.acField = config.acceptanceCriteriaField || process.env.JIRA_ACCEPTANCE_CRITERIA_FIELD || undefined;
+    this.productField = config.productField || process.env.JIRA_PRODUCT_FIELD || undefined;
+    this.storyPointsField = config.storyPointsField || process.env.JIRA_STORY_POINTS_FIELD || undefined;
     this.fetchImpl = config.fetchImpl || fetch;
+    this.timeoutMs = config.timeoutMs ?? 30000;
+    this.maxAttempts = Math.max(1, config.maxAttempts ?? 4);
+    this.sleep = config.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
   private get fields(): string[] {
-    const base = ['summary', 'description', 'labels', 'components', 'issuetype', 'status', 'priority', 'comment'];
-    return this.acField ? [...base, this.acField] : base;
+    const base = ['summary', 'description', 'labels', 'components', 'issuetype', 'status', 'priority', 'comment', 'parent', 'issuelinks', 'reporter'];
+    return [...base, this.acField, this.productField, this.storyPointsField].filter((f): f is string => !!f);
   }
 
   async getTask(issueKey: string): Promise<TaskInput> {
@@ -91,7 +118,94 @@ export class JiraClient {
 
   // ── Write-back (used by the automation watcher) ─────────────────────────────
 
+  /** Assigns the issue (e.g. back to its reporter). */
+  async assign(issueKey: string, accountId: string): Promise<void> {
+    await this.request(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/assignee`, {
+      method: 'PUT',
+      body: JSON.stringify({ accountId })
+    });
+  }
+
+  /** Web links attached to the issue (Confluence pages, docs, designs). */
+  async getRemoteLinks(issueKey: string): Promise<Array<{ title: string; url: string }>> {
+    const data = await this.request<Array<{ object?: { url?: string; title?: string } }>>(
+      `/rest/api/3/issue/${encodeURIComponent(issueKey)}/remotelink`
+    );
+    return (data || [])
+      .map((l) => ({ title: l.object?.title || l.object?.url || '', url: l.object?.url || '' }))
+      .filter((l) => l.url);
+  }
+
+  /**
+   * Plain text of a Confluence Cloud page, only on this same Atlassian site (credentials are
+   * never sent to another host). Returns undefined for anything else.
+   */
+  async getConfluencePageText(url: string): Promise<string | undefined> {
+    let u: URL;
+    try {
+      u = new URL(url);
+    } catch {
+      return undefined;
+    }
+    if (u.origin !== new URL(this.baseUrl).origin || !u.pathname.startsWith('/wiki/')) return undefined;
+    const id = /\/pages\/(\d+)/.exec(u.pathname)?.[1] || u.searchParams.get('pageId');
+    if (!id || !/^\d+$/.test(id)) return undefined;
+    const page = await this.request<{ body?: { storage?: { value?: string } } }>(`/wiki/api/v2/pages/${id}?body-format=storage`);
+    return htmlToText(page?.body?.storage?.value || '');
+  }
+
+  /** Earlier tickets in the same project whose text matches the title's main words. */
+  async findSimilarTasks(task: TaskInput, max = 5): Promise<TaskInput[]> {
+    const project = task.id.split('-')[0];
+    if (!/^[A-Z][A-Z0-9_]+$/i.test(project)) return [];
+    const words = [...new Set(task.title.toLowerCase().replace(/[^a-z0-9 ]/g, ' ').split(/\s+/).filter((w) => w.length >= 4 && !STOP_WORDS.has(w)))].slice(0, 6);
+    if (words.length === 0) return [];
+    const jql = `project = ${project} AND key != ${task.id} AND text ~ "${words.join(' ')}" ORDER BY updated DESC`;
+    return this.searchTasks(jql, max);
+  }
+
+  /**
+   * Extra context for the Planning Agent: linked documents and similar past tickets.
+   * Best effort: a failure here never blocks planning.
+   */
+  async enrichForPlanning(task: TaskInput): Promise<TaskInput> {
+    const meta = { ...(task.metadata || {}) };
+    try {
+      const links = await this.getRemoteLinks(task.id);
+      const documents: Array<{ title: string; url: string; text?: string }> = [];
+      for (const l of links.slice(0, 5)) {
+        const text = await this.getConfluencePageText(l.url).catch(() => undefined);
+        documents.push({ ...l, ...(text ? { text } : {}) });
+      }
+      if (documents.length) meta.documents = documents;
+    } catch {
+      /* no remote links or no permission */
+    }
+    try {
+      const similar = await this.findSimilarTasks(task);
+      if (similar.length) {
+        meta.similarTickets = similar.map((t) => ({
+          key: t.id,
+          title: t.title,
+          status: t.metadata?.status,
+          description: t.description.slice(0, 400)
+        }));
+      }
+    } catch {
+      /* search failed */
+    }
+    return { ...task, metadata: meta };
+  }
+
   /** Posts a comment: heading lines as paragraphs, optional preformatted block (e.g. the change plan). */
+  /** Posts a ready-made Atlassian Document Format body (rich comment: tables, panels, lozenges). */
+  async addCommentDoc(issueKey: string, body: Record<string, unknown>): Promise<void> {
+    await this.request(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
+      method: 'POST',
+      body: JSON.stringify({ body })
+    });
+  }
+
   async addComment(issueKey: string, lines: string[], preformatted?: string): Promise<void> {
     await this.request(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/comment`, {
       method: 'POST',
@@ -129,6 +243,30 @@ export class JiraClient {
     return true;
   }
 
+  /**
+   * When, and by whom, the ticket most recently moved INTO the given status (from the changelog).
+   * Used for status-driven triggers: who approved the plan, and whether this entry was already handled.
+   */
+  async getStatusEntry(issueKey: string, statusName: string): Promise<{ by?: string; at?: string } | undefined> {
+    const data = await this.request<{
+      values?: Array<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; toString?: string | null }> }>;
+    }>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?maxResults=100`);
+    const wanted = statusName.trim().toLowerCase();
+    const entries = (data.values || []).filter((v) =>
+      (v.items || []).some((i) => i.field === 'status' && (i.toString || '').trim().toLowerCase() === wanted)
+    );
+    const last = entries[entries.length - 1];
+    return last ? { by: last.author?.displayName, at: last.created } : undefined;
+  }
+
+  /** Names of every status the project's workflows define (to check a configured status exists). */
+  async projectStatusNames(projectKey: string): Promise<string[]> {
+    const data = await this.request<Array<{ statuses?: Array<{ name: string }> }>>(
+      `/rest/api/3/project/${encodeURIComponent(projectKey)}/statuses`
+    );
+    return [...new Set((data || []).flatMap((t) => (t.statuses || []).map((st) => st.name)))];
+  }
+
   /** Who most recently added a label (from the changelog), e.g. the approver of "ai-approved". */
   async getLabelAdder(issueKey: string, label: string): Promise<string | undefined> {
     const data = await this.request<{
@@ -145,27 +283,65 @@ export class JiraClient {
     return added.length ? added[added.length - 1].author?.displayName : undefined;
   }
 
+  /**
+   * One Jira REST call with a timeout and retries.
+   * - 429 (rate limited): always retried, honouring Retry-After; Jira did not process the request.
+   * - 502/503/504, timeouts and network errors: retried only for calls that are safe to repeat
+   *   (GET, PUT, and POST searches), never for creating comments or transitions, which could
+   *   then happen twice.
+   */
   private async request<T>(pathAndQuery: string, init: RequestInit = {}): Promise<T> {
-    const res = await this.fetchImpl(`${this.baseUrl}${pathAndQuery}`, {
-      ...init,
-      headers: {
-        Authorization: this.authHeader,
-        Accept: 'application/json',
-        'Content-Type': 'application/json',
-        ...(init.headers || {})
+    const method = (init.method || 'GET').toUpperCase();
+    const repeatable = method === 'GET' || method === 'PUT' || pathAndQuery.startsWith('/rest/api/3/search');
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
+      let res: Response;
+      try {
+        res = await this.fetchImpl(`${this.baseUrl}${pathAndQuery}`, {
+          ...init,
+          signal: AbortSignal.timeout(this.timeoutMs),
+          headers: {
+            Authorization: this.authHeader,
+            Accept: 'application/json',
+            'Content-Type': 'application/json',
+            ...(init.headers || {})
+          }
+        });
+      } catch (err) {
+        // Timeout or network failure: the request may or may not have reached Jira.
+        lastError = new Error(`Jira API ${method} ${pathAndQuery.split('?')[0]} failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (repeatable && attempt < this.maxAttempts) {
+          await this.sleep(this.backoffMs(attempt));
+          continue;
+        }
+        throw lastError;
       }
-    });
 
-    if (!res.ok) {
+      if (res.ok) {
+        // Write endpoints (labels, transitions) answer 204 No Content.
+        const text = await res.text();
+        return (text ? JSON.parse(text) : undefined) as T;
+      }
+
       const body = await res.text().catch(() => '');
+      const retryable = res.status === 429 || (repeatable && [502, 503, 504].includes(res.status));
+      if (retryable && attempt < this.maxAttempts) {
+        const retryAfter = Number(res.headers.get('retry-after'));
+        await this.sleep(Number.isFinite(retryAfter) && retryAfter > 0 ? Math.min(retryAfter * 1000, 60000) : this.backoffMs(attempt));
+        continue;
+      }
       const hint =
         res.status === 401 ? ' (check JIRA_EMAIL / JIRA_API_TOKEN)' :
-        res.status === 404 ? ' (issue not found or no permission)' : '';
+        res.status === 403 ? ' (the Jira account lacks permission for this action)' :
+        res.status === 404 ? ' (issue not found or no permission)' :
+        res.status === 429 ? ' (rate limited by Jira)' : '';
       throw new Error(`Jira API ${res.status}${hint}: ${body.slice(0, 500)}`);
     }
-    // Write endpoints (labels, transitions) answer 204 No Content.
-    const text = await res.text();
-    return (text ? JSON.parse(text) : undefined) as T;
+    throw lastError instanceof Error ? lastError : new Error('Jira API call failed');
+  }
+
+  private backoffMs(attempt: number): number {
+    return Math.min(1000 * 2 ** (attempt - 1), 15000) + Math.floor(Math.random() * 250);
   }
 
   toTask(issue: JiraIssue): TaskInput {
@@ -199,23 +375,60 @@ export class JiraClient {
           author: c.author?.displayName || 'unknown',
           created: c.created || '',
           body: adfToText(c.body).trim()
-        }))
+        })),
+        // Context for the Planning Agent.
+        parent: f.parent ? { key: f.parent.key, summary: f.parent.fields?.summary || '' } : undefined,
+        links: (f.issuelinks || [])
+          .map((l) => {
+            const other = l.outwardIssue || l.inwardIssue;
+            if (!other) return undefined;
+            return {
+              key: other.key,
+              relation: (l.outwardIssue ? l.type?.outward : l.type?.inward) || 'relates to',
+              summary: other.fields?.summary || '',
+              status: other.fields?.status?.name
+            };
+          })
+          .filter(Boolean),
+        reporter: f.reporter ? { name: f.reporter.displayName || 'unknown', accountId: f.reporter.accountId } : undefined,
+        product: this.productField ? selectValue(f[this.productField]) : undefined,
+        storyPoints: this.storyPointsField && typeof f[this.storyPointsField] === 'number' ? (f[this.storyPointsField] as number) : undefined
       }
     };
   }
 }
 
-/** Builds an ADF comment body: one paragraph per line, plus an optional code block. */
+/** Jira rejects comments over 32,767 characters (CONTENT_LIMIT_EXCEEDED). Stay well under it. */
+export const COMMENT_BUDGET = 24_000;
+const MAX_LINE = 1_000;
+const MAX_PRE = 8_000;
+
+/**
+ * Builds an ADF comment body: one paragraph per line, plus an optional code block.
+ * Capped so it always fits Jira's size limit: long lines and the code block are cut, and lines
+ * past the budget are replaced by one "N more lines not shown" line (a comment is never lost to size).
+ */
 export function commentAdf(lines: string[], preformatted?: string): AdfNode {
-  const content: AdfNode[] = lines
-    .filter((l) => l.trim().length > 0)
-    .map((l) => ({ type: 'paragraph', content: [{ type: 'text', text: l }] }));
-  if (preformatted && preformatted.trim()) {
-    // Jira limits comment size; keep the plan readable rather than failing the post.
-    const text = preformatted.length > 30000 ? `${preformatted.slice(0, 30000)}\n… (truncated)` : preformatted;
-    content.push({ type: 'codeBlock', content: [{ type: 'text', text }] });
+  const para = (text: string): AdfNode => ({ type: 'paragraph', content: [{ type: 'text', text }] });
+  const cut = (t: string, max: number) => (t.length > max ? `${t.slice(0, max)}… (truncated)` : t);
+  const kept = lines.filter((l) => l.trim().length > 0);
+  const content: AdfNode[] = [];
+  let used = 0;
+  for (let i = 0; i < kept.length; i++) {
+    const node = para(cut(kept[i], MAX_LINE));
+    const size = JSON.stringify(node).length;
+    if (used + size > COMMENT_BUDGET - MAX_PRE - 200) {
+      content.push(para(`… ${kept.length - i} more line(s) not shown (comment size limit). Full details are in the pipeline's job folder for this ticket.`));
+      break;
+    }
+    content.push(node);
+    used += size;
   }
-  return { type: 'doc', attrs: { version: 1 }, content } as AdfNode;
+  if (preformatted && preformatted.trim()) {
+    content.push({ type: 'codeBlock', content: [{ type: 'text', text: cut(preformatted, MAX_PRE) }] });
+  }
+  // ADF: "version" is a top-level property of the doc node (not attrs); Jira rejects anything else.
+  return { type: 'doc', version: 1, content } as unknown as AdfNode;
 }
 
 /** Converts Atlassian Document Format (or a plain string) to readable text. */
@@ -285,4 +498,30 @@ export function extractAcceptanceCriteria(text: string): { criteria: string[]; r
   const criteria = toLines(sectionLines.join('\n'));
   const remainder = [...lines.slice(0, start), ...lines.slice(end)].join('\n').trim();
   return { criteria, remainder };
+}
+
+const STOP_WORDS = new Set(['with', 'from', 'that', 'this', 'when', 'into', 'should', 'have', 'will', 'there', 'their', 'about', 'after', 'before', 'need', 'needs', 'make', 'add', 'update', 'issue', 'ticket']);
+
+/** Confluence storage HTML → readable plain text. */
+export function htmlToText(html: string): string {
+  return html
+    .replace(/<(script|style)[\s\S]*?<\/\1>/gi, '')
+    .replace(/<\/(p|div|h[1-6]|li|tr)>|<br\s*\/?>/gi, '\n')
+    .replace(/<li[^>]*>/gi, '- ')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** Value of a Jira select field ({ value }), or of a plain string field. */
+function selectValue(v: unknown): string | undefined {
+  if (typeof v === 'string') return v || undefined;
+  if (v && typeof v === 'object' && typeof (v as { value?: unknown }).value === 'string') return (v as { value: string }).value;
+  return undefined;
 }

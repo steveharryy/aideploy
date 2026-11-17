@@ -1,0 +1,53 @@
+# SAMPLE catalog: the three dummy repos under repositories/ (repo-a/b/c).
+# Used ONLY by the offline demo (npm start -- --demo) and the automated tests.
+# The live pipeline uses catalog/repos.yaml, which lists only real repos.
+
+repos:
+  - id: repo-a
+    name: Payment Service
+    purpose: Charges payments and exposes service health.
+    owner: sample
+    keywords: [payment, pay, checkout, charge]
+    modules: [payment-service, server]
+    files: [src/server.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+  - id: repo-b
+    name: Order Service
+    purpose: Creates and tracks orders.
+    owner: sample
+    keywords: [order, cart, fulfillment]
+    modules: [order-service]
+    files: [src/index.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+  - id: repo-c
+    name: Notification Service
+    purpose: Sends email, SMS and push notifications.
+    owner: sample
+    keywords: [notification, email, sms, push]
+    modules: [notification-service]
+    files: [src/index.ts]
+    verify:
+      - name: setup
+        run: npm install --no-package-lock --no-audit --no-fund
+        timeoutSec: 300
+      - name: test
+        run: npm test
+
+# Routes that send one ticket to several repos.
+routes:
+  - keywords: [auth, shared, cross-service, all services, all repositories]
+    repos: [repo-a, repo-b]
+    modules: [shared-auth, gateway]
+    files: [repo-a/src/server.ts, repo-b/src/index.ts]

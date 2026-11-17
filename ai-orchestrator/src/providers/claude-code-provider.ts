@@ -62,7 +62,7 @@ export interface ClaudeCodeProviderConfig {
 }
 
 /** Tools the agent may use. Bash is limited to build/test commands; no web, no MCP connectors. */
-const ALLOWED_TOOLS = [
+export const ALLOWED_TOOLS = [
   'Read',
   'Edit',
   'Write',
@@ -76,11 +76,25 @@ const ALLOWED_TOOLS = [
   'Bash(node:*)',
   'Bash(ls:*)'
 ];
-const DISALLOWED_TOOLS = ['WebFetch', 'WebSearch'];
+export const DISALLOWED_TOOLS = ['WebFetch', 'WebSearch'];
 
 /** Never copied into / collected from the sandbox. */
-const IGNORED_DIRS = new Set(['.git', 'dist', 'coverage', '.worktrees', '.handoff', '.jobs']);
-const IGNORED_FILES = new Set(['package-lock.json', '.DS_Store']);
+export const IGNORED_DIRS = new Set(['.git', 'dist', 'coverage', '.worktrees', '.handoff', '.jobs']);
+export const IGNORED_FILES = new Set(['package-lock.json', '.DS_Store']);
+
+/**
+ * Filter for copying a repo into a sandbox: skips only TOP-LEVEL build/VCS folders
+ * (dist, .git, coverage, ...). Folders with the same names inside node_modules
+ * (e.g. node_modules/vitest/dist) must be kept, or installed tools break.
+ */
+export function sandboxCopyFilter(repoRoot: string): (src: string) => boolean {
+  const root = path.resolve(repoRoot);
+  return (src: string) => {
+    const rel = path.relative(root, path.resolve(src));
+    if (!rel) return true;
+    return !IGNORED_DIRS.has(rel.split(path.sep)[0]);
+  };
+}
 
 /** Environment passed to the agent: enough to run node/npm, nothing secret. */
 const ENV_ALLOWLIST = ['PATH', 'HOME', 'USER', 'LOGNAME', 'SHELL', 'TMPDIR', 'LANG', 'LC_ALL', 'TERM'];
@@ -258,7 +272,7 @@ Answer with ONLY one JSON object, no prose, in exactly this shape:
       await fs.cp(repoContext.repoPath, sandbox, {
         recursive: true,
         verbatimSymlinks: true,
-        filter: (src) => !IGNORED_DIRS.has(path.basename(src))
+        filter: sandboxCopyFilter(repoContext.repoPath)
       });
       const before = await snapshot(sandbox);
 
@@ -315,7 +329,7 @@ Answer with ONLY one JSON object, no prose, in exactly this shape:
   }
 }
 
-interface ClaudeResult {
+export interface ClaudeResult {
   type?: string;
   subtype?: string;
   is_error?: boolean;
@@ -323,9 +337,10 @@ interface ClaudeResult {
   num_turns?: number;
   total_cost_usd?: number;
   duration_ms?: number;
+  session_id?: string;
 }
 
-function parseResult(raw: string): ClaudeResult {
+export function parseResult(raw: string): ClaudeResult {
   const text = raw.trim();
   try {
     return JSON.parse(text) as ClaudeResult;
@@ -353,7 +368,7 @@ export function parsePlan(text: string): ImplementationPlan {
   return { raw: text.trim() };
 }
 
-function safeEnv(): NodeJS.ProcessEnv {
+export function safeEnv(): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const key of ENV_ALLOWLIST) {
     if (process.env[key]) env[key] = process.env[key];
@@ -402,7 +417,7 @@ export async function collectChanges(root: string, before: Map<string, string>):
 }
 
 /** Default runner: spawns the CLI, feeds the prompt on stdin, returns stdout. */
-const runClaudeCli: ClaudeCodeRunner = ({ bin, args, cwd, prompt, env, timeoutMs }) =>
+export const runClaudeCli: ClaudeCodeRunner = ({ bin, args, cwd, prompt, env, timeoutMs }) =>
   new Promise((resolve, reject) => {
     const child = spawn(bin, args, { cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
     let stdout = '';

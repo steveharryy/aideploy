@@ -5,6 +5,8 @@
   "scripts": {
     "start": "npm --prefix ai-orchestrator start --",
     "qa": "npm --prefix ai-orchestrator run qa",
+    "watch": "npm --prefix ai-orchestrator run watch --",
+    "webhook": "npm --prefix ai-orchestrator run webhook --",
     "clean": "npm --prefix ai-orchestrator run clean",
     "test": "npm --prefix ai-orchestrator test",
     "typecheck": "npm --prefix ai-orchestrator run typecheck",

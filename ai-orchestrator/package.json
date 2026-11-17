@@ -7,12 +7,12 @@
   "scripts": {
     "start": "tsx src/index.ts",
     "dev": "tsx watch src/index.ts",
-    "qa": "tsx src/qa-runner.ts",
-    "clean": "tsx src/clean-repos.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "watch": "tsx src/index.ts --watch"
+    "watch": "tsx src/index.ts --watch",
+    "webhook": "tsx src/index.ts --webhook",
+    "code": "tsx src/code.ts"
   },
   "keywords": [
     "orchestrator",
@@ -23,14 +23,16 @@
   "license": "ISC",
   "dependencies": {
     "@anthropic-ai/sdk": "^1.8.0",
+    "@modelcontextprotocol/sdk": "1.32.2",
     "dotenv": "^16.4.7",
     "yaml": "^2.9.1"
   },
   "devDependencies": {
-    "@anthropic-ai/claude-code": "^2.1.197",
-    "@types/node": "^20.17.10",
+    "@anthropic-ai/claude-code": "2.1.315",
+    "@types/node": "24.19.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
+    "vite": "8.3.5",
+    "vitest": "5.1.0"
   }
 }

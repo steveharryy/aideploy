@@ -1,0 +1,104 @@
+# Pipeline limits and switches: one file, read fresh before every step, so a change applies
+# without a deploy or restart. Override the path with PIPELINE_CONFIG_PATH.
+
+# Stop everything new: no ticket is picked up and no AI run starts while this is true.
+# Emergency override without editing the file: AI_KILL_SWITCH=true
+kill_switch: false
+
+# Coding phase. false: adding "ai-approved" only gets a Jira comment saying coding is off;
+# no branch, no code, no PR. Missing = false.
+coding:
+  enabled: true
+
+# System prompt file: prompts/<prompt_version>.md (versioned in Git; logged with every plan)
+prompt_version: planning-v3
+
+planning:
+  # tools:    the agent can only use the planner tools (jira_read, list_repos, search_code,
+  #           read_file, submit_plan), each with guards in our code. Recommended.
+  # readonly: older mode, Claude Code's own Read/Glob/Grep and a JSON answer.
+  engine: tools
+  # Jira projects jira_read may open, in addition to the ticket's own project.
+  allowed_jira_projects: [T2]
+  # Pin a model ID (never "latest"); empty = the Claude Code CLI default.
+  model: ""
+  max_tokens_per_run: 300000      # not enforceable through Claude Code; the cost cap below applies instead
+  max_cost_usd_per_ticket: 5      # hard cap per planning run (passed to Claude Code)
+  max_tool_calls: 80              # enforced by the planner tool server; real repos need ~15-45 (agent is warned 5 before the end)
+  max_wall_clock_min: 20          # planning run is killed after this
+  max_question_rounds: 3          # then the ticket goes back to the reporter (matches the AI Agent Jira Workflow doc)
+  max_plan_revisions: 3           # "request changes" rounds, then back to the reporter
+
+# Cheap checks before any AI call. Failing tickets go back to the reporter.
+intake:
+  min_description_chars: 50       # description + written acceptance criteria
+  require_product: true
+  allowed_products: [SportsBull, GameBull, Binara, Coin]
+  require_component: true         # and the component must be in config/components.yaml
+  allowed_issue_types: [Bug, Story]
+  max_story_points: 3             # tickets without an estimate pass
+  assign_to_reporter: true        # when sending a ticket back
+
+# Per-project intake rules (override the defaults above). Current target: T2.
+# T2 has no Product field and no components; areas are tagged with labels (coin-sportsbook,
+# betslip, coin-markets, gamebull…), which config/components.yaml can map to repos.
+projects:
+  T2:
+    intake:
+      require_product: false
+      require_component: false      # turn on once T2 area labels are mapped in config/components.yaml
+      allowed_issue_types: [Story, Task, Bug]   # not Request Tasks (access/infra requests), Epics or Sub-tasks
+
+jira:
+  product_field: customfield_10224
+  story_points_field: customfield_10070
+
+  # The pipeline's phase lives in our session store (.jobs/<ticket>/session.json), not in Jira
+  # labels. Jira only keeps the two human triggers: ai-ready and ai-approved.
+  # Optionally, show the phase on boards by moving tickets to EXISTING workflow statuses.
+  # Off until the team agrees the mapping below; leave a phase empty to not move on it.
+  move_status: false
+  # STATUS-DRIVEN MODE (off until a Jira admin has created the "AI Agent Jira Workflow" statuses).
+  # To turn it on: uncomment trigger_status, set move_status: true, replace the phase_status below
+  # with the block under "NEW WORKFLOW", then restart the watcher. If a status name does not exist in
+  # the project the watcher says so and keeps using labels, so a typo cannot break it.
+  #   trigger_status: { plan: AI Planning, implement: AI Dev }   # entering these statuses starts the pipeline
+  #
+  # NEW WORKFLOW phase_status (per project key):
+  #   T2:
+  #     needs_input: Needs Input
+  #     needs_info: Needs Input
+  #     plan_review: Plan Review
+  #     qa: AI QA              # independent re-test running
+  #     pr_open: Human Review  # PR raised, a person reviews it
+  #     needs_human: Needs Input
+  #   (planning = AI Planning and coding = AI Dev are the trigger statuses themselves: no move needed.)
+  phase_status:
+    RT:
+      planning: In Solutioning
+      needs_input: On Hold
+      needs_info: Ready for Grooming
+      plan_review: Pending Approval
+      approved:
+      coding: Dev in Progress
+      pr_open:
+      done:
+      needs_human: On Hold
+    T2:
+      planning: Grooming in Progress
+      needs_input: Blocked
+      needs_info: Product To Do
+      plan_review:
+      approved:
+      coding: Engineering In Progress
+      pr_open: Code Review
+      done:
+      needs_human: Blocked
+
+# Used from the queue/Slack steps onwards.
+concurrency:
+  max_active_sessions: 3
+timers:
+  escalate_after_h: 4
+  remind_after_h: 24
+  give_up_after_h: 48

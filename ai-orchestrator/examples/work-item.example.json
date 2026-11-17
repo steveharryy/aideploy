@@ -1,0 +1,18 @@
+{
+  "ticket": "PAY-101",
+  "workItemId": "W1",
+  "repo": "repo-a",
+  "title": "Add health endpoint",
+  "summary": "Add a getHealth() method to PaymentServer that reports the service as UP with a timestamp.",
+  "acceptanceCriteria": [
+    { "id": "AC1", "text": "PaymentServer.getHealth() returns status 'UP'" },
+    { "id": "AC2", "text": "The health response includes an ISO-8601 timestamp" }
+  ],
+  "testPlan": [
+    { "ac": "AC1", "name": "test_AC1_health_reports_up", "description": "getHealth().status === 'UP'" },
+    { "ac": "AC2", "name": "test_AC2_health_has_iso_timestamp", "description": "timestamp parses as a valid ISO date" }
+  ],
+  "plannedFiles": [{ "path": "src/server.ts", "change": "add getHealth() and a HealthStatus type" }],
+  "assumptions": ["No HTTP framework is added; the method is called directly by the service layer"],
+  "clarifications": []
+}

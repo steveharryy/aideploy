@@ -1,104 +1,139 @@
-# Service catalog: the single source of truth for repos.
+# Service catalog: the single source of truth for the REAL repos the pipeline may plan and change.
 #
-# Every repo the orchestrator may change is listed here. Routing, deploy order and the
-# verify contract are all read from this file — no code changes needed to add a repo.
+# Repos are the pipeline's own clean clones in ai-orchestrator/.repos/<repo> (gitignored),
+# on baseBranch. Developers' working copies (e.g. ~/Work/<repo>) are never read or touched.
+# Refresh before a planning run:  git -C .repos/<repo> pull --ff-only
 #
 # Fields per repo:
-#   id          unique id (also used as a routing keyword)
-#   path        absolute path, or relative to REPOSITORIES_ROOT (default: the id)
-#   baseBranch  branch ticket branches start from (default: the repo's current HEAD)
-#   keywords    whole-word words / Jira labels / components that route a ticket here
-#   dependsOn   repos that must finish first (deploy order)
-#   verify      commands that must ALL pass (the verify contract), starting with an install/setup
-#               step so dependency changes are installed before tests run. If empty, the
-#               Testing Agent falls back to `make verify`, then `npm test`.
-#   owner, purpose, devUrl, jenkinsJob: documentation for agents and humans
+#   id          unique id (used by plans and the component map)
+#   path        absolute, or relative to REPOSITORIES_ROOT (default: ai-orchestrator/repositories)
+#   baseBranch  the branch planning reads and ticket branches start from (team decision: PRE, the integration branch; gb-bo-admin-fe uses lower-case "pre")
+#   bitbucket   where pull requests are opened
+#   keywords    whole-word hints for routing (the Planning Agent confirms in the code)
+#   verify      commands that must ALL pass, starting with install
 #
-# The three sample repos below reproduce the orchestrator's built-in routing exactly.
+# Not listed: gb-webhook-api-service (its main branch has no code yet; code lives on QA/PRE).
+# The dummy demo repos (repo-a/b/c) live in tests/fixtures/sample-catalog.yaml, for tests and --demo only.
 
 repos:
-  - id: repo-a
-    name: Payment Service
-    purpose: Charges payments and exposes service health.
-    owner: sample
-    keywords: [payment, pay, checkout, charge]
-    modules: [payment-service, server]
-    files: [src/server.ts]
-    verify:
-      - name: setup
-        run: npm install --no-package-lock --no-audit --no-fund
-        timeoutSec: 300
-      - name: test
-        run: npm test
-
-  - id: repo-b
-    name: Order Service
-    purpose: Creates and tracks orders.
-    owner: sample
-    keywords: [order, cart, fulfillment]
-    modules: [order-service]
-    files: [src/index.ts]
-    verify:
-      - name: setup
-        run: npm install --no-package-lock --no-audit --no-fund
-        timeoutSec: 300
-      - name: test
-        run: npm test
-
-  - id: repo-c
-    name: Notification Service
-    purpose: Sends email, SMS and push notifications.
-    owner: sample
-    keywords: [notification, email, sms, push]
-    modules: [notification-service]
-    files: [src/index.ts]
-    verify:
-      - name: setup
-        run: npm install --no-package-lock --no-audit --no-fund
-        timeoutSec: 300
-      - name: test
-        run: npm test
-
   - id: gb-homepage-api
     name: GameBull Homepage API (homepage-service)
     purpose: >-
       Read-only Express/TypeScript API serving homepage, event, market and SportsBull data from Redis;
       proxies user activity/exposure to the Match and ATH services.
     owner: gamebull
-    # Downloaded copy inside repositories/ (not a git clone) -> worked on in place.
-    path: rosstech-gb-homepage-api-service-354e9dc693fa
-    # PRs: active once `path` points to a real git clone and BITBUCKET_* credentials are set.
-    # Repo slug inferred from the download name (rosstech-gb-homepage-api-service-<commit>) — confirm.
-    bitbucket:
-      workspace: rosstech
-      repo: gb-homepage-api-service
-    # baseBranch: develop   # set to the branch PRs should target when the clone is configured
-    keywords:
-      - homepage-service
-      - gb-homepage
-      - rosstech-gb
-      - getExposure
-      - ActivityController
-      - EventController
-      - MarketController
-      - HomePageController
-      - SportsBullController
-      - IpService
-      - buildEventsV2Response
-      - getUserCountry
+    path: gb-homepage-api-service
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gb-homepage-api-service }
+    keywords: [homepage-service, gb-homepage, homepage, getExposure, ActivityController, EventController, MarketController,
+               HomePageController, SportsBullController, IpService, buildEventsV2Response, getUserCountry]
     modules: [homepage-service]
     verify:
-      - name: install
-        run: npm install --no-package-lock --no-audit --no-fund
-        timeoutSec: 300
-      - name: typecheck
-        run: npx tsc --noEmit
-      - name: test
-        run: npm test
+      - { name: install, run: npm install --no-package-lock --no-audit --no-fund, timeoutSec: 600 }
+      - { name: build, run: npm run build }
 
-# Routes that send one ticket to several repos.
-routes:
-  - keywords: [auth, shared, cross-service, all services, all repositories]
-    repos: [repo-a, repo-b]
-    modules: [shared-auth, gateway]
-    files: [repo-a/src/server.ts, repo-b/src/index.ts]
+  - id: gb-payments-api
+    name: GameBull Payments API
+    purpose: >-
+      Express/TypeORM (MySQL/Postgres) + Redis API for deposits, withdrawals, transactions and wallet
+      responses; payment gateway integrations (fzpay, PayPlus, WebXPay, 0xProcessing crypto) and backoffice
+      payment endpoints.
+    owner: gamebull
+    path: ../.repos/gb-payments-api-service
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gb-payments-api-service }
+    keywords: [deposit, withdrawal, withdraw, payments-api, payment gateway, fzpay, payplus, webxpay, oxprocessing,
+               0xprocessing, crypto network, transactionController, walletResponse]
+    modules: [payments]
+    verify:
+      - { name: install, run: npm ci --no-audit --no-fund, timeoutSec: 600 }
+      - { name: build, run: npm run build }
+      - { name: test, run: npm test }
+
+  - id: gb-event-api
+    name: GameBull Event API
+    purpose: >-
+      Express/TypeORM + Redis/DynamoDB API for sports events, markets, categories, seasons, teams, banners,
+      images, MMP and activity data.
+    owner: gamebull
+    path: ../.repos/gb-event-api-service
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gb-event-api-service }
+    keywords: [event-api, event-service, mmp, season, banner, category, team, eventController, marketController]
+    modules: [events]
+    verify:
+      - { name: install, run: npm install --no-package-lock --no-audit --no-fund, timeoutSec: 600 }
+      - { name: build, run: npm run build }
+
+  - id: gb-onboarding-api
+    name: GameBull Onboarding API
+    purpose: >-
+      Express/TypeORM + Redis/DynamoDB/SES API for user onboarding (signup, login, users), clients, exchange,
+      game providers (Alea, QTech), Freshdesk and backoffice user endpoints.
+    owner: gamebull
+    path: ../.repos/gb-onboarding-api-service
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gb-onboarding-api-service }
+    keywords: [onboarding, signup, sign up, registration, login, otp, freshdesk, qtech, alea, onboarding-service]
+    modules: [onboarding]
+    verify:
+      - { name: install, run: npm install --no-package-lock --no-audit --no-fund, timeoutSec: 600 }
+      - { name: build, run: npm run build }
+
+  - id: gb-backoffice-api
+    name: GameBull Backoffice API
+    purpose: >-
+      Express/TypeORM API behind the backoffice: admin users, roles and permissions, activity log and
+      webhook endpoints.
+    owner: gamebull
+    path: ../.repos/gb-backoffice-api-service
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gb-backoffice-api-service }
+    keywords: [backoffice-api, backoffice api, permission, permissions, role, roles, admin user, WebhookController]
+    modules: [backoffice-api]
+    verify:
+      - { name: install, run: npm install --no-package-lock --no-audit --no-fund, timeoutSec: 600 }
+      - { name: build, run: npm run build }
+
+  - id: gb-bo-admin-fe
+    name: GameBull Backoffice Admin (web)
+    purpose: >-
+      Next.js/React backoffice admin web app used by ops and support (users, payments and withdrawals,
+      dashboards); talks to the backoffice, payments and event APIs.
+    owner: gamebull
+    path: gb-bo-admin-fe
+    baseBranch: pre
+    bitbucket: { workspace: rosstech, repo: gb-bo-admin-fe }
+    keywords: [admin panel, backoffice ui, bo-admin, admin-fe, backoffice screen]
+    modules: [backoffice-ui]
+    verify:
+      - { name: install, run: pnpm install --frozen-lockfile, timeoutSec: 900 }
+      - { name: test, run: pnpm exec vitest run --passWithNoTests }
+      # next.config.ts validates NEXT_PUBLIC_* (env.ts), so the verification build needs placeholder values.
+      # These are fake and only used for this check; they never reach a deployed environment.
+      - name: build
+        run: >-
+          NEXT_PUBLIC_SITE_URL=https://example.com NEXT_PUBLIC_API_TIMEOUT=30000 NEXT_PUBLIC_APP_NAME=admin
+          NEXT_PUBLIC_APP_VERSION=0.0.0 NEXT_PUBLIC_DEFAULT_LANGUAGE=en NEXT_PUBLIC_DEFAULT_THEME=light
+          NEXT_PUBLIC_APP_DESCRIPTION=ci NEXT_PUBLIC_APP_KEYWORDS=ci NEXT_PUBLIC_CREATOR=ci
+          NEXT_PUBLIC_TWITTER_HANDLE=ci NEXT_PUBLIC_PERSONAL_WEBSITE=https://example.com
+          NEXT_PUBLIC_BASE_URL=https://example.com NEXT_PUBLIC_BASE_URL_UPLOAD_PATH=https://example.com/upload
+          NEXT_PUBLIC_FE_HOME_PAGE_BASE_URL=https://example.com NEXT_PUBLIC_FE_HOME_PAGE_BASE_URL_LKR=https://example.com
+          NEXT_PUBLIC_BASE_URL_LKR=https://example.com pnpm run build
+        timeoutSec: 900
+
+  - id: gamebull-web
+    name: GameBull player web app (gamebull-global-new)
+    purpose: >-
+      Player-facing GameBull web app (React, TanStack Start/Router, Vite SSR): sportsbook and casino screens,
+      wallet, deposit/withdrawal UI, onboarding and profile.
+    owner: gamebull
+    path: ../.repos/gamebull-global-new
+    baseBranch: PRE
+    bitbucket: { workspace: rosstech, repo: gamebull-global-new }
+    keywords: [gamebull-global, gamebull web, player app, website, frontend, ui, ux, screen, page, button]
+    modules: [player-web]
+    verify:
+      - { name: install, run: pnpm install --frozen-lockfile, timeoutSec: 900 }
+      - { name: test, run: pnpm exec vitest run --passWithNoTests }
+      - { name: build, run: pnpm run build, timeoutSec: 900 }

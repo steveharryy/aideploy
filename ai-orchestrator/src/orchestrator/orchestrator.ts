@@ -36,6 +36,8 @@ export interface OrchestratorOptions {
    * (design doc: "tech lead approves the plan"). Resolve false to stop with PLAN_REJECTED.
    */
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  /** Optional progress hook: called when the independent re-test starts (shown as the QA phase). Never fatal. */
+  onStage?: (stage: 'testing') => void | Promise<void>;
 }
 
 /** Read-only preview of what a run would do. */
@@ -56,6 +58,7 @@ export class Orchestrator {
   private resolveRepoPath?: (repoId: string) => string;
   private resolveBaseBranch?: (repoId: string) => string | undefined;
   private approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  private onStage?: (stage: 'testing') => void | Promise<void>;
 
   constructor(options: OrchestratorOptions) {
     this.aiProvider = options.aiProvider;
@@ -72,6 +75,7 @@ export class Orchestrator {
     this.resolveRepoPath = options.resolveRepoPath;
     this.resolveBaseBranch = options.resolveBaseBranch;
     this.approvePlan = options.approvePlan;
+    this.onStage = options.onStage;
     if (this.workspace && !this.resolveRepoPath) {
       throw new Error('Orchestrator: resolveRepoPath is required when a workspace manager is configured.');
     }
@@ -185,6 +189,23 @@ export class Orchestrator {
       return fail('IMPACT_FAILED', `Impact Analysis failed: ${errorMessage}`, { deduplication });
     }
 
+    // The human-approved change plan defines the scope: only repos it plans file changes for are touched,
+    // even if keyword routing (re-run here) would match more.
+    const approvedPlans = task.metadata?.approvedPlans as Record<string, { filesToChange?: Array<{ path?: string }> }> | undefined;
+    // A structured plan (Planning Agent) lists its repos in approvedRepos; its per-repo briefs have no
+    // filesToChange. Older single-repo plans are scoped by the repos that plan file changes.
+    const structuredRepos = Array.isArray(task.metadata?.approvedRepos) ? (task.metadata!.approvedRepos as unknown[]).map(String) : [];
+    if (structuredRepos.length > 0) {
+      const leftOut = impact.affectedRepositories.filter((r) => !structuredRepos.includes(r));
+      if (leftOut.length) this.log('IMPACT ANALYSIS', `Not in the approved plan, left out: ${leftOut.join(', ')}`);
+      impact = { ...impact, affectedRepositories: structuredRepos, reasoning: `Scope of the approved change plan: ${structuredRepos.join(', ')}.` };
+    } else if (approvedPlans && Object.keys(approvedPlans).length > 0) {
+      const approvedRepos = Object.keys(approvedPlans).filter((r) => (approvedPlans[r]?.filesToChange ?? []).some((f) => f?.path));
+      const leftOut = impact.affectedRepositories.filter((r) => !approvedRepos.includes(r));
+      if (leftOut.length) this.log('IMPACT ANALYSIS', `Not in the approved plan, left out: ${leftOut.join(', ')}`);
+      impact = { ...impact, affectedRepositories: approvedRepos, reasoning: `Scope of the approved change plan: ${approvedRepos.join(', ') || 'none'}.` };
+    }
+
     if (impact.affectedRepositories.length === 0) {
       this.log('IMPACT ANALYSIS', `No repository matched this task. ${impact.reasoning}`);
       this.log('RESULT', 'Stopped: no matching repository (needs triage)');
@@ -294,6 +315,7 @@ export class Orchestrator {
     // Step 4: Testing Agent Verification
     this.log('TESTING', 'Running tests on modified repositories...');
     begin('verify');
+    await Promise.resolve(this.onStage?.('testing')).catch(() => {});
     let testingResult: TestingResult;
     try {
       testingResult = await this.testingAgent.runTests(impact.affectedRepositories, workdirs);
