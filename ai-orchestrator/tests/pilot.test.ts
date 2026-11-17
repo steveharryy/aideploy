@@ -18,7 +18,7 @@ import { GitWorkspaceManager } from '../src/workspace/git-workspace.js';
 import type { FileChange, TaskInput } from '../src/models/types.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const catalogFile = path.resolve(__dirname, '../catalog/repos.yaml');
+const catalogFile = path.resolve(__dirname, 'fixtures/sample-catalog.yaml');
 let tmp = '';
 
 beforeAll(async () => {

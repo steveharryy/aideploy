@@ -12,11 +12,19 @@ import { MockAIProvider } from './providers/ai-provider.js';
 import { ClaudeProvider } from './providers/claude-provider.js';
 import { HandoffProvider } from './providers/handoff-provider.js';
 import { ClaudeCodeProvider, type ImplementationPlan } from './providers/claude-code-provider.js';
+import { PlanningAgent, PlanningRunError, type PlannerRepo } from './agents/planning/planning-agent.js';
+import { codingBrief, repoDependencies, workItemsForCoding } from './agents/planning/plan-rules.js';
+import { renderMissing, renderPlan, renderQuestions } from './agents/planning/render.js';
+import type { PlanQuestion, TicketPlan } from './agents/planning/types.js';
 import { CodingAgentProvider } from './providers/coding-agent-provider.js';
 import type { CodingReport } from './agents/coding/coding-agent.js';
 import { JiraClient } from './integrations/jira/jira-client.js';
 import { ServiceCatalog } from './catalog/service-catalog.js';
-import { JobStore } from './jobs/job-store.js';
+import { ComponentMap } from './catalog/component-map.js';
+import { intakeFor, killSwitchOn, loadPipelineConfig, type PipelineConfig } from './config/pipeline-config.js';
+import { runIntake } from './agents/intake/intake.js';
+import { JobStore, PROCESS_INSTANCE } from './jobs/job-store.js';
+import { FileSessionStore } from './jobs/session-store.js';
 import { GitWorkspaceManager } from './workspace/git-workspace.js';
 import { BitbucketClient } from './integrations/bitbucket/bitbucket-client.js';
 import {
@@ -28,7 +36,9 @@ import {
   type PullRequestLink,
   type WatcherLabels
 } from './automation/watcher.js';
-import type { ImpactAnalysisResult, TaskInput } from './models/types.js';
+import { startWebhookServer } from './automation/webhook-server.js';
+import { redactSecrets } from './util/redact.js';
+import type { ImpactAnalysisResult, OrchestratorResult, TaskInput } from './models/types.js';
 
 dotenv.config();
 
@@ -36,10 +46,34 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = process.env.REPOSITORIES_ROOT
   ? path.resolve(process.cwd(), process.env.REPOSITORIES_ROOT)
   : path.resolve(__dirname, '../repositories');
-const catalogPath = process.env.CATALOG_PATH
+let catalogPath = process.env.CATALOG_PATH
   ? path.resolve(process.cwd(), process.env.CATALOG_PATH)
   : path.resolve(__dirname, '../catalog/repos.yaml');
+/** The dummy repos (repo-a/b/c) for the offline demo; never used by the live pipeline. */
+const sampleCatalogPath = path.resolve(__dirname, '../tests/fixtures/sample-catalog.yaml');
 const jobsDir = path.resolve(process.cwd(), process.env.JOBS_DIR || '.jobs');
+const pipelineConfigPath = process.env.PIPELINE_CONFIG_PATH
+  ? path.resolve(process.cwd(), process.env.PIPELINE_CONFIG_PATH)
+  : path.resolve(__dirname, '../config/pipeline.yaml');
+const componentMapPath = process.env.COMPONENT_MAP_PATH
+  ? path.resolve(process.cwd(), process.env.COMPONENT_MAP_PATH)
+  : path.resolve(__dirname, '../config/components.yaml');
+
+/** Read fresh every time: limits and switches change without a restart. */
+function pipelineConfig(): PipelineConfig {
+  return loadPipelineConfig(pipelineConfigPath);
+}
+const killSwitch = () => killSwitchOn(pipelineConfigPath);
+
+function loadComponentMap(catalog: ServiceCatalog | undefined): ComponentMap | undefined {
+  return ComponentMap.load(componentMapPath, catalog?.repos.map((r) => r.id));
+}
+
+/** Jira client with the custom fields the pipeline reads (Product, story points). */
+function makeJira(): JiraClient {
+  const cfg = pipelineConfig();
+  return new JiraClient({ productField: cfg.jira.productField, storyPointsField: cfg.jira.storyPointsField });
+}
 const worktreesDir = path.resolve(process.cwd(), process.env.WORKTREES_DIR || '.worktrees');
 
 const PROVIDERS = ['mock', 'claude', 'claude-code', 'coding-agent', 'handoff'];
@@ -70,6 +104,8 @@ function makeCodingAgentProvider(catalog: ServiceCatalog | undefined): CodingAge
 export interface CreateOrchestratorOptions {
   /** Human approval after impact analysis, before any code is written. */
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  /** Progress hook: the independent re-test is starting (the watcher shows it as the QA phase). */
+  onStage?: (stage: 'testing') => void | Promise<void>;
 }
 
 /** Loaded once: routing, repo paths, deploy order and verify contract (catalog/repos.yaml). */
@@ -138,7 +174,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
     workspace: makeWorkspace(),
     resolveRepoPath: (repoId) => repoPaths[repoId] || path.resolve(repoRoot, repoId),
     resolveBaseBranch: (repoId) => catalog?.get(repoId)?.baseBranch,
-    approvePlan: options.approvePlan
+    approvePlan: options.approvePlan,
+    onStage: options.onStage
   });
 }
 
@@ -146,7 +183,7 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
 function makeWorkspace(): GitWorkspaceManager {
   return new GitWorkspaceManager({
     worktreesDir,
-    remoteGitArgs: () => new BitbucketClient().gitRemoteArgs(),
+    remoteGitEnv: () => new BitbucketClient().gitRemoteEnv(),
     log: (m) => console.log(`[WORKSPACE] ${m}`)
   });
 }
@@ -156,6 +193,207 @@ function makeClaudeCodeProvider(catalog: ServiceCatalog | undefined): ClaudeCode
     verifyCommandsFor: (id) => catalog?.verifyCommands(id).map((v) => v.run) ?? [],
     repoPurposeFor: (id) => catalog?.get(id)?.purpose
   });
+}
+
+function makePlanningAgent(catalog: ServiceCatalog | undefined, cfg: PipelineConfig, componentMap: ComponentMap | undefined): PlanningAgent {
+  const repos: PlannerRepo[] = catalog
+    ? catalog.repos.map((r) => ({
+        id: r.id,
+        name: r.name,
+        purpose: r.purpose,
+        path: catalog.resolvePath(r.id),
+        keywords: r.keywords,
+        dependsOn: r.dependsOn,
+        verify: catalog.verifyCommands(r.id).map((v) => v.run)
+      }))
+    : fs
+        .readdirSync(repoRoot, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => ({ id: d.name, path: path.join(repoRoot, d.name) }));
+  const promptFile = path.resolve(__dirname, '../prompts', `${cfg.promptVersion}.md`);
+  if (cfg.planning.engine === 'tools' && !fs.existsSync(promptFile)) {
+    throw new Error(`System prompt ${promptFile} not found (prompt_version "${cfg.promptVersion}" in ${pipelineConfigPath}).`);
+  }
+  // Only what the tool server needs to read Jira; never passed to the model.
+  const toolServerEnv = Object.fromEntries(
+    [
+      ['JIRA_BASE_URL', process.env.JIRA_BASE_URL],
+      ['JIRA_EMAIL', process.env.JIRA_EMAIL],
+      ['JIRA_API_TOKEN', process.env.JIRA_API_TOKEN],
+      ['JIRA_PRODUCT_FIELD', cfg.jira.productField],
+      ['JIRA_STORY_POINTS_FIELD', cfg.jira.storyPointsField]
+    ].filter((e): e is [string, string] => !!e[1])
+  );
+  return new PlanningAgent({
+    repos,
+    engine: cfg.planning.engine,
+    ...(cfg.planning.engine === 'tools' ? { systemPrompt: fs.readFileSync(promptFile, 'utf-8') } : {}),
+    maxToolCalls: cfg.planning.maxToolCalls || undefined,
+    allowedProjects: cfg.planning.allowedJiraProjects.length ? cfg.planning.allowedJiraProjects : undefined,
+    components: componentMap?.entries,
+    toolServerEnv,
+    // Intake (plain code) runs first: no tokens on tickets that are incomplete.
+    hardChecks: (task) => runIntake(task, intakeFor(cfg, task.id), componentMap).gaps,
+    model: cfg.planning.model || undefined,
+    timeoutMs: cfg.planning.maxWallClockMin > 0 ? cfg.planning.maxWallClockMin * 60 * 1000 : undefined,
+    maxBudgetUsd: cfg.planning.maxCostUsdPerTicket || undefined
+  });
+}
+
+/** Per-repo facts shown to the approver: where changes go, how they are verified, how to roll back. */
+async function repoExecutionLines(
+  task: TaskInput,
+  repoId: string,
+  catalog: ServiceCatalog | undefined,
+  providerName: string,
+  why: string
+): Promise<{ header: string[]; tail: string[] }> {
+  const repoPath = catalog?.resolvePath(repoId) ?? path.resolve(repoRoot, repoId);
+  const isGit = await GitWorkspaceManager.isGitRepoRoot(repoPath);
+  const branch = GitWorkspaceManager.branchName('ai/', task.id);
+  const baseBranch = catalog?.get(repoId)?.baseBranch;
+  const prTarget = isGit && catalog?.get(repoId)?.bitbucket && baseBranch && new BitbucketClient().configured ? baseBranch : undefined;
+  const verify = catalog?.verifyCommands(repoId).map((v) => v.run) ?? [];
+  const verifyText = verify.length ? verify.join('  →  ') : 'make verify / npm test (fallback)';
+
+  const header = [
+    '',
+    `REPOSITORY  ${repoId}${catalog?.get(repoId)?.name ? `  (${catalog.get(repoId)!.name})` : ''}`,
+    `  Why this repo : ${why}`,
+    `  Path          : ${repoPath}`,
+    `  Changes go to : ${isGit ? `new branch ${branch} from the latest ${baseBranch ? `origin/${baseBranch}` : 'checked-out commit'}, in a separate worktree (your checkout is not touched)` : 'the folder itself (not a standalone git repo, so no branch)'}`,
+    `  Verify        : ${verifyText}`
+  ];
+  const tail = ['', '  Process after approval'];
+  if (providerName === 'coding-agent') {
+    tail.push(
+      `     1) Copy ${repoId} to a sandbox; baseline: every verify step must pass before any change`,
+      '     2) Coding agent writes tests named per AC (AC1…); pipeline checks: only test files, every AC covered, suite now FAILS',
+      '     3) Coding agent implements (tests locked); pipeline runs the checks + scope gates (secrets, debug output, out-of-plan files);',
+      `        an independent reviewer agent checks the diff; fix rounds share a budget. Verify: ${verifyText}`
+    );
+  } else if (providerName === 'claude-code') {
+    tail.push(
+      `     1) Copy ${repoId} to a temporary sandbox (the real folder is not touched yet)`,
+      '     2) Claude Code writes the tests first and confirms they FAIL on the current code',
+      `     3) Claude Code implements the approved plan and runs: ${verifyText}`
+    );
+  } else {
+    tail.push(`     1-3) AI step: ${describeProvider(providerName)}`);
+  }
+  tail.push(
+    '     4) Pipeline safety checks: every file stays inside the repo; no test deleted, skipped or weakened',
+    `     5) Pipeline applies the changes to ${isGit ? `branch ${branch} (separate worktree)` : 'the folder in place'}`,
+    `     6) Pipeline re-runs the verify steps itself: ${verifyText}`,
+    `     7) Result saved to .jobs/${task.id}/ (job.json, coding report, diff)${isGit ? `; commit on ${branch}` : ''}`,
+    `     8) ${prTarget ? `Push ${branch} and open a pull request into ${prTarget}; it is never merged automatically` : 'No pull request (needs a git clone + bitbucket/baseBranch in the catalog + Bitbucket credentials)'}`,
+    `  Rollback      : ${isGit ? `delete branch ${branch} and its worktree; your base branch is never changed` : 'no git history in this folder: restore from a backup/copy (or clone the real repo to get branch-based rollback)'}`
+  );
+  return { header, tail };
+}
+
+export type TicketPlanStatus = 'ready' | 'needs-input' | 'needs-info' | 'invalid';
+
+interface TicketPlanResult {
+  status: TicketPlanStatus;
+  ticketPlan: TicketPlan;
+  problems: string[];
+  repos: string[];
+  /** Per-repo brief for the coding agent. */
+  plans: Record<string, Record<string, unknown>>;
+  repoDependencies: Record<string, string[]>;
+  text: string;
+  promptVersion: string;
+  costUsd?: number;
+  engine?: string;
+  toolCalls?: unknown[];
+  repoFacts?: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }>;
+}
+
+/**
+ * Planning phase (claude-code provider): the Planning Agent reads the ticket and every catalog
+ * repo read-only and returns a structured plan. Code maps its verdict to the next step.
+ */
+async function buildTicketPlan(task: TaskInput, candidateRepos: string[], providerName: string): Promise<TicketPlanResult> {
+  const catalog = loadCatalog();
+  const cfg = pipelineConfig();
+  const componentMap = loadComponentMap(catalog);
+  const resolved = componentMap?.resolveTicket(
+    Array.isArray(task.metadata?.components) ? (task.metadata!.components as string[]) : [],
+    Array.isArray(task.metadata?.labels) ? (task.metadata!.labels as string[]) : []
+  );
+  if (task.metadata?.source === 'jira') {
+    console.log('\n[PLANNING] Gathering context: linked documents and similar past tickets...');
+    task = await makeJira().enrichForPlanning(task);
+  }
+  console.log('\n[PLANNING] Planning Agent is reading the ticket and the repositories (read-only)...');
+  const result = await makePlanningAgent(catalog, cfg, componentMap).plan(task, {
+    // Component map first, keyword routing only as a fallback.
+    candidateRepos: resolved?.repos.length ? resolved.repos : candidateRepos,
+    componentHint: resolved?.matched.length
+      ? resolved.matched.map((c) => `${c} → ${componentMap!.get(c)!.repos.join(', ')}`).join('; ')
+      : undefined,
+    riskFloor: resolved?.riskFloor,
+    componentRepos: resolved?.repos,
+    riskFloorForRepos: componentMap ? (repos) => componentMap.riskFloorForRepos(repos) : undefined,
+    previousQuestions: task.metadata?.previousQuestions as PlanQuestion[] | undefined,
+    previousPlan: task.metadata?.previousPlan as TicketPlan | undefined
+  });
+  const plan = result.plan;
+  const status: TicketPlanStatus =
+    // Problems first: an incomplete gap analysis means the verdict itself cannot be trusted.
+    result.problems.length ? 'invalid' : plan.readiness === 'blocking' ? 'needs-input' : plan.readiness === 'too_vague' ? 'needs-info' : 'ready';
+  const repos = [...new Set(plan.workItems.map((w) => w.repo))];
+  const repoFacts: Array<{ repo: string; branch?: string; verify?: string; rollback?: string }> = [];
+
+  const hr = '─'.repeat(78);
+  const L: string[] = ['', hr, `TICKET PLAN  ${task.id}  (${status === 'ready' ? 'for approval' : status})`, hr, `Ticket   : ${task.title}`];
+  if (task.metadata?.url) L.push(`Link     : ${String(task.metadata.url)}`);
+  if (result.modelCalled) L.push('', renderPlan(plan));
+  if (plan.questions.length) {
+    L.push('', 'BLOCKING QUESTIONS');
+    for (const q of plan.questions) L.push(`  ${q.id}. ${q.text}`, ...q.options.map((o) => `      - ${o}${o === q.defaultOption ? '  (default)' : ''}`));
+  }
+  if (plan.missingForReporter.length) L.push('', 'MISSING FROM THE TICKET', ...plan.missingForReporter.map((m) => `  - ${m}`));
+  if (result.problems.length) L.push('', 'PLAN PROBLEMS (cannot be approved as-is)', ...result.problems.map((p) => `  - ${p}`));
+  if (status === 'ready') {
+    for (const item of plan.workItems) {
+      const { header, tail } = await repoExecutionLines(task, item.repo, catalog, providerName, item.reason || item.task);
+      L.push(...header, ...tail);
+      const repoPath = catalog?.resolvePath(item.repo) ?? path.resolve(repoRoot, item.repo);
+      const isGit = await GitWorkspaceManager.isGitRepoRoot(repoPath);
+      const branch = GitWorkspaceManager.branchName('ai/', task.id);
+      const verify = catalog?.verifyCommands(item.repo).map((v) => v.run) ?? [];
+      repoFacts.push({
+        repo: item.repo,
+        ...(isGit ? { branch } : {}),
+        verify: verify.length ? verify.join(' → ') : 'make verify / npm test',
+        rollback: isGit ? `delete branch ${branch} and its worktree` : 'restore the folder from a copy (not a git clone)'
+      });
+    }
+  }
+  L.push('', result.modelCalled ? `(Drafted by the Planning Agent, ${result.engine === 'tools' ? `planner tools only (${result.toolCalls?.length ?? 0} tool calls)` : 'read-only'}; prompt ${cfg.promptVersion}${result.stats ? `; ${result.stats}` : ''})` : '(Stopped by the intake checks; no AI call was made)');
+  L.push(hr);
+
+  const plans: Record<string, Record<string, unknown>> = {};
+  for (const r of repos) {
+    const brief = codingBrief(plan, r);
+    if (brief) plans[r] = brief;
+  }
+  return {
+    status,
+    ticketPlan: plan,
+    problems: result.problems,
+    repos,
+    plans,
+    repoDependencies: repoDependencies(plan),
+    text: L.join('\n'),
+    promptVersion: cfg.promptVersion,
+    ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+    engine: result.engine,
+    toolCalls: result.toolCalls,
+    repoFacts
+  };
 }
 
 /** Ticket words that routed it to a repo (shown to the approver as "why this repo"). */
@@ -223,21 +461,16 @@ async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, pr
   for (const repoId of impact.affectedRepositories) {
     const repoPath = catalog?.resolvePath(repoId) ?? path.resolve(repoRoot, repoId);
     const isGit = await GitWorkspaceManager.isGitRepoRoot(repoPath);
-    const branch = GitWorkspaceManager.branchName('ai/', task.id);
     const baseBranch = catalog?.get(repoId)?.baseBranch;
-    const prTarget = isGit && catalog?.get(repoId)?.bitbucket && baseBranch && new BitbucketClient().configured ? baseBranch : undefined;
-    const verify = catalog?.verifyCommands(repoId).map((v) => v.run) ?? [];
-    const verifyText = verify.length ? verify.join('  →  ') : 'make verify / npm test (fallback)';
     const matched = matchedKeywords(task, repoId, catalog);
-
-    L.push('', `REPOSITORY  ${repoId}${catalog?.get(repoId)?.name ? `  (${catalog.get(repoId)!.name})` : ''}`);
-    L.push(`  Why this repo : ticket mentions ${matched.length ? matched.join(', ') : '(matched by routing rule)'}`);
-    L.push(`  Path          : ${repoPath}`);
-    L.push(
-      `  Changes go to : ${isGit ? `new branch ${branch} from the latest ${baseBranch ? `origin/${baseBranch}` : 'checked-out commit'}, in a separate worktree (your checkout is not touched)` : 'the folder itself (not a standalone git repo, so no branch)'}`
+    const { header, tail } = await repoExecutionLines(
+      task,
+      repoId,
+      catalog,
+      providerName,
+      `ticket mentions ${matched.length ? matched.join(', ') : '(matched by routing rule)'}`
     );
-    L.push(`  Verify        : ${verifyText}`);
-    L.push('');
+    L.push(...header, '');
 
     if (planner) {
       // Plan against the same code the coding agent will start from: the latest base branch.
@@ -270,33 +503,7 @@ async function buildChangePlan(task: TaskInput, impact: ImpactAnalysisResult, pr
       L.push(`  Change plan   : detailed plan is drafted only with --provider claude-code (current: ${providerName})`);
     }
 
-    L.push('', '  Process after approval');
-    if (providerName === 'coding-agent') {
-      L.push(
-        `     1) Copy ${repoId} to a sandbox; baseline: every verify step must pass before any change`,
-        '     2) Coding agent writes tests named per AC (AC1…); pipeline checks: only test files, every AC covered, suite now FAILS',
-        '     3) Coding agent implements (tests locked); pipeline runs the checks + scope gates (secrets, debug output, out-of-plan files);',
-        `        an independent reviewer agent checks the diff; fix rounds share a budget. Verify: ${verifyText}`
-      );
-    } else if (providerName === 'claude-code') {
-      L.push(
-        `     1) Copy ${repoId} to a temporary sandbox (the real folder is not touched yet)`,
-        '     2) Claude Code writes the tests first and confirms they FAIL on the current code',
-        `     3) Claude Code implements the approved plan and runs: ${verifyText}`
-      );
-    } else {
-      L.push(`     1-3) AI step: ${describeProvider(providerName)}`);
-    }
-    L.push(
-      '     4) Pipeline safety checks: every file stays inside the repo; no test deleted, skipped or weakened',
-      `     5) Pipeline applies the changes to ${isGit ? `branch ${branch} (separate worktree)` : 'the folder in place'}`,
-      `     6) Pipeline re-runs the verify steps itself: ${verifyText}`,
-      `     7) Result saved to .jobs/${task.id}/ (job.json, coding report, diff)${isGit ? `; commit on ${branch}` : ''}`,
-      `     8) ${prTarget ? `Push ${branch} and open a pull request into ${prTarget}; it is never merged automatically` : 'No pull request (needs a git clone + bitbucket/baseBranch in the catalog + Bitbucket credentials)'}`
-    );
-    L.push(
-      `  Rollback      : ${isGit ? `delete branch ${branch} and its worktree; your base branch is never changed` : 'no git history in this folder: restore from a backup/copy (or clone the real repo to get branch-based rollback)'}`
-    );
+    L.push(...tail);
   }
   L.push(hr);
   return { plans, text: L.join('\n'), dropped };
@@ -318,12 +525,36 @@ function describeProvider(providerName: string): string {
 }
 
 /** Saves the plan and the decision next to the job record (audit trail). */
-function savePlanRecord(taskId: string, text: string, decision: string): string {
+function savePlanRecord(taskId: string, text: string, decision: string, planned?: TicketPlanResult): string {
   const dir = path.join(jobsDir, taskId.replace(/[^A-Za-z0-9._-]/g, '_'));
   fs.mkdirSync(dir, { recursive: true });
+  if (planned) {
+    fs.writeFileSync(
+      path.join(dir, 'ticket-plan.json'),
+      JSON.stringify(
+        { promptVersion: planned.promptVersion, engine: planned.engine, costUsd: planned.costUsd, status: planned.status, plan: planned.ticketPlan, toolCalls: planned.toolCalls },
+        null,
+        2
+      )
+    );
+  }
   const file = path.join(dir, 'plan.md');
   fs.writeFileSync(file, `# Change plan ${taskId}\n\n\`\`\`\n${text.trim()}\n\`\`\`\n\n**Decision:** ${decision} at ${new Date().toISOString()}\n`);
   return file;
+}
+
+/** Asks the human in the terminal (or auto-approves with --yes). */
+async function askApproval(taskId: string, autoYes: boolean): Promise<{ approved: boolean; decision: string }> {
+  if (autoYes) return { approved: true, decision: 'APPROVED (auto, --yes)' };
+  if (!process.stdin.isTTY) return { approved: false, decision: 'NOT APPROVED (no interactive terminal; re-run with --yes to approve)' };
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    const answer = (await rl.question(`\nApprove this change plan and start implementation for ${taskId}? [y/N] `)).trim().toLowerCase();
+    const approved = answer === 'y' || answer === 'yes';
+    return { approved, decision: approved ? 'APPROVED' : `NOT APPROVED (answer: "${answer || 'empty'}")` };
+  } finally {
+    rl.close();
+  }
 }
 
 /** Interactive gate: shows the full change plan and asks for approval (or auto-approves with --yes). */
@@ -331,24 +562,7 @@ function makeApprovalGate(providerName: string, autoYes: boolean) {
   return async (task: TaskInput, impact: ImpactAnalysisResult): Promise<boolean> => {
     const { plans, text } = await buildChangePlan(task, impact, providerName);
     console.log(text);
-
-    let approved = false;
-    let decision = '';
-    if (autoYes) {
-      approved = true;
-      decision = 'APPROVED (auto, --yes)';
-    } else if (!process.stdin.isTTY) {
-      decision = 'NOT APPROVED (no interactive terminal; re-run with --yes to approve)';
-    } else {
-      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-      try {
-        const answer = (await rl.question(`\nApprove this change plan and start implementation for ${task.id}? [y/N] `)).trim().toLowerCase();
-        approved = answer === 'y' || answer === 'yes';
-        decision = approved ? 'APPROVED' : `NOT APPROVED (answer: "${answer || 'empty'}")`;
-      } finally {
-        rl.close();
-      }
-    }
+    const { approved, decision } = await askApproval(task.id, autoYes);
 
     // The coding step follows exactly the plan that was approved.
     if (approved && Object.keys(plans).length) {
@@ -365,6 +579,7 @@ function printUsage(): void {
   npm start -- T2-547              Run a Jira ticket (note the space after "--")
   npm start -- --demo               Run the built-in PAY-101 sample demo on repositories/repo-a
   npm run watch                     AUTOMATION: poll Jira for labelled tickets and run them end to end
+  npm run webhook                   AUTOMATION: receive Jira webhooks (POST /webhooks/jira) instead of polling
   npm run watch -- --once           One polling cycle and exit (for Jenkins/cron)
   npm run watch -- --dry-run        Show what the watcher would do; no Jira writes, no AI runs
   npm start -- RT-123 [RT-124 ...]  Fetch Jira issue(s) by key and run them through the pipeline
@@ -376,7 +591,8 @@ function printUsage(): void {
   npm start -- RT-123 --provider claude-code
                                     Full pipeline with Claude Code as the coding agent
                                     (same as AI_PROVIDER=claude-code; providers: mock, claude, claude-code, coding-agent, handoff)
-  npm start -- --status RT-123      Show the saved job state (stages, branches, commits) for a ticket
+  npm start -- --status RT-123      Show a ticket's pipeline phase (history) and saved job state
+  npm start -- --sessions           List every ticket's pipeline phase
   npm start -- --unlock RT-123      Remove a stuck lock for a ticket (only if no run is active)`);
 }
 
@@ -389,16 +605,18 @@ interface CliArgs {
   yes: boolean;
   demo: boolean;
   watch: boolean;
+  webhook: boolean;
   once: boolean;
   interval: number;
   provider?: string;
   help: boolean;
   status?: string;
   unlock?: string;
+  sessions: boolean;
 }
 
 function parseArgs(argv: string[]): CliArgs {
-  const args: CliArgs = { keys: [], max: 5, dryRun: false, plan: false, yes: false, demo: false, watch: false, once: false, interval: 120, help: false };
+  const args: CliArgs = { keys: [], max: 5, dryRun: false, plan: false, yes: false, demo: false, watch: false, webhook: false, sessions: false, once: false, interval: 120, help: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--jql') args.jql = argv[++i];
@@ -408,6 +626,8 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === '--yes' || a === '-y') args.yes = true;
     else if (a === '--demo') args.demo = true;
     else if (a === '--watch') args.watch = true;
+    else if (a === '--webhook') args.webhook = true;
+    else if (a === '--sessions') args.sessions = true;
     else if (a === '--once') args.once = true;
     else if (a === '--interval') args.interval = Number(argv[++i]) || args.interval;
     else if (a === '--provider') args.provider = (argv[++i] || '').toLowerCase();
@@ -421,7 +641,7 @@ function parseArgs(argv: string[]): CliArgs {
 }
 
 async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerName: string): Promise<void> {
-  const jira = new JiraClient();
+  const jira = makeJira();
 
   const tasks: TaskInput[] = [];
   for (const key of args.keys) {
@@ -455,6 +675,76 @@ async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerN
       continue;
     }
 
+    if (!args.dryRun && killSwitch()) {
+      console.log(`\nKill switch is on (${pipelineConfigPath} or AI_KILL_SWITCH): ${task.id} not started.`);
+      failures++;
+      continue;
+    }
+    if (CLAUDE_CODE_PROVIDERS.includes(providerName)) {
+      // Planning phase first (dedup → Planning Agent), then approval, then the coding pipeline.
+      const preview = await orchestrator.plan(task);
+      console.log(`\n[DEDUPLICATION] ${preview.deduplication.status.toUpperCase()}: ${preview.deduplication.reason}`);
+      if (preview.deduplication.status === 'duplicate') {
+        failures++;
+        continue;
+      }
+      let planned: TicketPlanResult;
+      try {
+        planned = await buildTicketPlan(task, preview.impact?.affectedRepositories ?? [], providerName);
+      } catch (err) {
+        // One ticket failing must not stop the others.
+        console.log(`\n[PLANNING] ${task.id} failed: ${err instanceof Error ? err.message : String(err)}`);
+        if (!args.plan) new FileSessionStore(jobsDir).setPhase(task.id, 'needs_human', `CLI run: planning failed`);
+        failures++;
+        continue;
+      }
+      console.log(planned.text);
+      const readyLabel = process.env.LABEL_READY || DEFAULT_LABELS.ready;
+      if (planned.status === 'needs-input') console.log('\n' + renderQuestions(planned.ticketPlan, readyLabel, 1, 1).join('\n'));
+      if (planned.status === 'needs-info') console.log('\n' + renderMissing(planned.ticketPlan, readyLabel).join('\n'));
+      if (args.plan) {
+        savePlanRecord(task.id, planned.text, `PREVIEW ONLY (${planned.status})`, planned);
+        console.log(`\n(Plan only: nothing was locked, written or changed. Saved to .jobs/${task.id}/. To run it: npm start -- ${task.id})`);
+        continue;
+      }
+      const sessions = new FileSessionStore(jobsDir);
+      if (planned.status !== 'ready') {
+        sessions.setPhase(
+          task.id,
+          planned.status === 'needs-input' ? 'needs_input' : planned.status === 'needs-info' ? 'needs_info' : 'needs_human',
+          `CLI run: plan ${planned.status}`
+        );
+        savePlanRecord(task.id, planned.text, `NOT STARTED (${planned.status})`, planned);
+        console.log(`\nNot started: the plan is "${planned.status}". Update the ticket and run again.`);
+        failures++;
+        continue;
+      }
+      const { approved, decision } = await askApproval(task.id, args.yes);
+      console.log(`Plan decision: ${decision}  (saved to ${savePlanRecord(task.id, planned.text, decision, planned)})`);
+      if (!approved) {
+        sessions.setPhase(task.id, 'plan_review', `CLI run: ${decision}`);
+        failures++;
+        continue;
+      }
+      if (!pipelineConfig().coding.enabled) {
+        sessions.setPhase(task.id, 'approved', `CLI run: ${decision}; coding switched off`);
+        console.log(`\nPlan approved. The coding phase is switched off (coding.enabled in ${pipelineConfigPath}): no branch, code or PR.`);
+        continue;
+      }
+      sessions.setPhase(task.id, 'coding', `CLI run: ${decision}`);
+      task.metadata = {
+        ...(task.metadata || {}),
+        approvedPlans: planned.plans,
+        approvedRepos: planned.repos,
+        approvedRepoDependencies: planned.repoDependencies,
+        workItems: workItemsForCoding(planned.ticketPlan, task.title)
+      };
+      const result = await createOrchestrator(providerName, { approvePlan: async () => true }).run(task);
+      sessions.setPhase(task.id, result.success ? 'done' : 'needs_human', `CLI run: ${result.status}`);
+      if (!reportResult(result)) failures++;
+      continue;
+    }
+
     if (args.plan) {
       const preview = await orchestrator.plan(task);
       console.log(`\n[DEDUPLICATION] ${preview.deduplication.status.toUpperCase()}: ${preview.deduplication.reason}`);
@@ -468,69 +758,115 @@ async function runJiraTasks(orchestrator: Orchestrator, args: CliArgs, providerN
       continue;
     }
 
-    const result = await orchestrator.run(task);
-    console.log(`\n--- ${result.taskId}: ${result.status} (${result.durationMs}ms) ---`);
-    for (const r of result.teamResult?.repoResults ?? []) {
-      console.log(`Repo [${r.repoId}] via ${r.providerUsed}: ${r.changedFiles.join(', ') || 'no changes'}`);
-      console.log(`  Reasoning: ${r.reasoning}`);
-    }
-    for (const b of result.branches ?? []) {
-      if (b.managedByGit) console.log(`Branch [${b.repoId}]: ${b.branch}${b.commit ? ` @ ${b.commit.slice(0, 10)}` : ''} (worktree ${b.workdir})`);
-    }
-    for (const repoTest of result.testingResult?.repoResults ?? []) {
-      for (const check of repoTest.checks.filter((c) => !c.passed)) {
-        const detail = (check.error || check.output || '').trim().split('\n').slice(-6).join('\n      ');
-        console.log(`Verify FAILED [${repoTest.repoId}] ${check.name}:\n      ${detail}`);
-      }
-    }
-    if (result.jobFile) console.log(`Job state: ${result.jobFile}`);
-    if (!result.success) {
+    if (!pipelineConfig().coding.enabled) {
+      console.log(`\n${task.id}: the coding phase is switched off (coding.enabled in ${pipelineConfigPath}). Use --plan to see the plan.`);
       failures++;
-      if (result.status !== 'DUPLICATE_SKIPPED') console.log(`Error: ${result.error}`);
+      continue;
     }
+    const result = await orchestrator.run(task);
+    if (!reportResult(result)) failures++;
   }
 
   if (failures > 0) process.exitCode = 1;
+}
+
+/** Prints a pipeline result; returns whether it succeeded. */
+function reportResult(result: OrchestratorResult): boolean {
+  console.log(`\n--- ${result.taskId}: ${result.status} (${result.durationMs}ms) ---`);
+  for (const r of result.teamResult?.repoResults ?? []) {
+    console.log(`Repo [${r.repoId}] via ${r.providerUsed}: ${r.changedFiles.join(', ') || 'no changes'}`);
+    console.log(`  Reasoning: ${r.reasoning}`);
+  }
+  for (const b of result.branches ?? []) {
+    if (b.managedByGit) console.log(`Branch [${b.repoId}]: ${b.branch}${b.commit ? ` @ ${b.commit.slice(0, 10)}` : ''} (worktree ${b.workdir})`);
+  }
+  for (const repoTest of result.testingResult?.repoResults ?? []) {
+    for (const check of repoTest.checks.filter((c) => !c.passed)) {
+      const detail = (check.error || check.output || '').trim().split('\n').slice(-6).join('\n      ');
+      console.log(`Verify FAILED [${repoTest.repoId}] ${check.name}:\n      ${detail}`);
+    }
+  }
+  if (result.jobFile) console.log(`Job state: ${result.jobFile}`);
+  if (!result.success && result.status !== 'DUPLICATE_SKIPPED') console.log(`Error: ${result.error}`);
+  return result.success;
 }
 
 /** Prevents two watchers from processing the same tickets at once. */
 function acquireWatcherLock(): (() => void) | undefined {
   fs.mkdirSync(jobsDir, { recursive: true });
   const lockFile = path.join(jobsDir, '.watcher.lock');
-  try {
-    const held = JSON.parse(fs.readFileSync(lockFile, 'utf-8')) as { pid: number };
+  const mine = JSON.stringify({ pid: process.pid, instance: PROCESS_INSTANCE, startedAt: new Date().toISOString() });
+  for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      process.kill(held.pid, 0);
-      return undefined; // another watcher is alive
-    } catch {
-      /* stale lock from a dead process: take over */
+      fs.writeFileSync(lockFile, mine, { flag: 'wx' }); // atomic: fails if another process holds it
+      return () => fs.rmSync(lockFile, { force: true });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
     }
-  } catch {
-    /* no lock */
+    if (!watcherLockIsStale(lockFile)) return undefined; // another watcher is alive
+    fs.rmSync(lockFile, { force: true }); // stale: take over (second loop iteration)
   }
-  fs.writeFileSync(lockFile, JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() }));
-  return () => fs.rmSync(lockFile, { force: true });
+  return undefined;
 }
 
-async function runWatch(args: CliArgs, providerName: string): Promise<void> {
-  const release = args.dryRun ? () => {} : acquireWatcherLock();
-  if (!release) {
-    console.error(`Another watcher is already running (see ${path.join(jobsDir, '.watcher.lock')}).`);
-    process.exitCode = 1;
-    return;
+/**
+ * A watcher lock is stale when its process is gone, or when it carries OUR pid but another process
+ * instance: after an unclean stop in a container the new process often gets the same pid, which
+ * would otherwise look alive.
+ */
+export function watcherLockIsStale(lockFile: string, pid = process.pid, instance = PROCESS_INSTANCE): boolean {
+  let held: { pid?: number; instance?: string };
+  try {
+    held = JSON.parse(fs.readFileSync(lockFile, 'utf-8')) as { pid?: number; instance?: string };
+  } catch {
+    return true; // unreadable or half-written: nobody can be relying on it
   }
+  if (!held.pid) return true;
+  if (held.pid === pid) return held.instance !== instance;
+  try {
+    process.kill(held.pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
 
+/** Ctrl+C (SIGINT) and service-manager stops (SIGTERM from systemd, docker, k8s) end runs the same way. */
+function onStopSignal(handler: () => void): void {
+  process.on('SIGINT', handler);
+  process.on('SIGTERM', handler);
+}
+
+/** The label-driven automation (shared by the poller and the webhook server). */
+/**
+ * Status-driven triggers from config/pipeline.yaml (jira.trigger_status), checked against the
+ * project's real statuses. A name Jira does not know would make every search fail, so a mismatch
+ * falls back to labels only, with a clear message, instead of breaking the watcher.
+ */
+async function resolveTriggerStatus(): Promise<{ plan: string; implement: string } | undefined> {
+  const ts = pipelineConfig().jira.triggerStatus;
+  if (!ts) return undefined;
+  const project = process.env.AUTOMATION_PROJECT || 'T2';
+  try {
+    const known = (await makeJira().projectStatusNames(project)).map((n) => n.toLowerCase());
+    const missing = [ts.plan, ts.implement].filter((n) => !known.includes(n.toLowerCase()));
+    if (missing.length) {
+      console.error(`Status triggers NOT enabled: project ${project} has no status named ${missing.map((m) => `"${m}"`).join(' / ')}. Labels only for now. Ask a Jira admin to add it (see the workflow request), then restart.`);
+      return undefined;
+    }
+  } catch (err) {
+    console.error(`Status triggers NOT enabled: could not read the statuses of project ${project} (${redactSecrets(err instanceof Error ? err.message : String(err))}). Labels only for now.`);
+    return undefined;
+  }
+  return ts;
+}
+
+function createWatcher(args: CliArgs, providerName: string, triggerStatus?: { plan: string; implement: string }) {
   const labels: WatcherLabels = {
     ready: process.env.LABEL_READY || DEFAULT_LABELS.ready,
-    planPending: process.env.LABEL_PLAN_PENDING || DEFAULT_LABELS.planPending,
-    approved: process.env.LABEL_APPROVED || DEFAULT_LABELS.approved,
-    inProgress: process.env.LABEL_IN_PROGRESS || DEFAULT_LABELS.inProgress,
-    prRaised: process.env.LABEL_PR_RAISED || DEFAULT_LABELS.prRaised,
-    done: process.env.LABEL_DONE || DEFAULT_LABELS.done,
-    needsHuman: process.env.LABEL_NEEDS_HUMAN || DEFAULT_LABELS.needsHuman
+    approved: process.env.LABEL_APPROVED || DEFAULT_LABELS.approved
   };
   const project = process.env.AUTOMATION_PROJECT || 'T2';
-  const summaryTag = process.env.AUTOMATION_SUMMARY_TAG ?? labels.ready;
   // Whose tickets this watcher acts on. Default: only tickets reported by the Jira account in .env
   // (so two people testing their own pipelines on the same project never pick up each other's tickets).
   // AUTOMATION_REPORTER=any watches everyone's tickets; or give a Jira account id.
@@ -538,38 +874,56 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
   const reporterClause = reporter.toLowerCase() === 'any' ? '' : ` AND reporter = ${reporter === 'currentUser()' ? reporter : `"${reporter}"`}`;
   const jql =
     process.env.AUTOMATION_JQL ||
-    `project = ${project}${reporterClause} AND (labels in ("${labels.ready}", "${labels.approved}", "${labels.planPending}", "${labels.needsHuman}")` +
-      `${summaryTag ? ` OR summary ~ "\\"${summaryTag}\\""` : ''}) AND statusCategory != Done ORDER BY updated ASC`;
+    `project = ${project}${reporterClause} AND (labels in ("${labels.ready}", "${labels.approved}")${triggerStatus ? ` OR status in ("${triggerStatus.plan}", "${triggerStatus.implement}")` : ''}) AND statusCategory != Done ORDER BY updated ASC`;
   const store = new JobStore({ jobsDir });
-  const jira = new JiraClient();
-  const log = (m: string) => console.log(`[${new Date().toISOString().slice(11, 19)}] ${m}`);
+  const jira = makeJira();
+  const log = (m: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(m)}`);
 
   const watcher = new AutomationWatcher(
     {
       jql,
       labels,
       autoApprove: process.env.AUTO_APPROVE_PLAN === 'true',
+      codingEnabled: () => pipelineConfig().coding.enabled,
       maxAttempts: Number(process.env.AUTOMATION_MAX_ATTEMPTS) || 3,
-      statusInProgress: process.env.JIRA_STATUS_IN_PROGRESS || undefined,
-      statusInReview: process.env.JIRA_STATUS_IN_REVIEW || undefined,
-      dryRun: args.dryRun,
-      // Create forms without a Labels field: "ai-ready" in the summary starts the flow,
-      // and the plan is approved/rejected by commenting /approve or /reject.
-      summaryTag: summaryTag || undefined,
-      approveCommand: process.env.AUTOMATION_APPROVE_COMMAND ?? '/approve',
-      rejectCommand: process.env.AUTOMATION_REJECT_COMMAND ?? '/reject',
-      retryCommand: process.env.AUTOMATION_RETRY_COMMAND ?? '/retry'
+      ...(triggerStatus ? { statusTriggers: triggerStatus } : {}),
+      maxQuestionRounds: Number(process.env.AUTOMATION_MAX_QUESTION_ROUNDS) || pipelineConfig().planning.maxQuestionRounds,
+      maxPlanRevisions: pipelineConfig().planning.maxPlanRevisions,
+      assignToReporter: intakeFor(pipelineConfig(), `${project}-0`).assignToReporter,
+      // Existing workflow statuses per phase (config/pipeline.yaml → jira), read fresh each time.
+      statusForPhase: (ticket, phase) => {
+        const cfg = pipelineConfig().jira;
+        return cfg.moveStatus ? cfg.phaseStatus[ticket.split('-')[0]]?.[phase] : undefined;
+      },
+      dryRun: args.dryRun
     },
     {
       jira,
       jobsDir,
       log,
       attempts: (id) => store.read(id)?.attempt ?? 0,
+      killSwitch,
       async plan(task): Promise<PlanOutcome> {
         try {
           const preview = await createOrchestrator(providerName).plan(task);
           if (preview.deduplication.status === 'duplicate') {
             return { status: 'duplicate', reason: preview.deduplication.reason, repos: [], plans: {}, text: '' };
+          }
+          if (CLAUDE_CODE_PROVIDERS.includes(providerName)) {
+            // The Planning Agent chooses repos itself; keyword routing is only a hint.
+            const planned = await buildTicketPlan(task, preview.impact?.affectedRepositories ?? [], providerName);
+            const base = {
+              repos: planned.repos,
+              plans: planned.plans,
+              text: planned.text,
+              ticketPlan: planned.ticketPlan,
+              repoDependencies: planned.repoDependencies,
+              promptVersion: planned.promptVersion,
+              costUsd: planned.costUsd,
+              repoFacts: planned.repoFacts
+            };
+            if (planned.status === 'invalid') return { ...base, status: 'error', reason: `The plan has problems: ${planned.problems.join(' ')}` };
+            return { ...base, status: planned.status };
           }
           if (!preview.impact || preview.impact.affectedRepositories.length === 0) {
             return { status: 'no-repo', repos: [], plans: {}, text: '' };
@@ -590,10 +944,13 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
           }
           return { status: 'ready', repos, plans: changePlan.plans, text: changePlan.text };
         } catch (err) {
-          return { status: 'error', reason: err instanceof Error ? err.message : String(err), repos: [], plans: {}, text: '' };
+          const reason = err instanceof Error ? err.message : String(err);
+          // Usage/rate limits and overload are temporary: keep the trigger and try again next cycle.
+          const status = err instanceof PlanningRunError && err.temporary ? 'retry-later' : 'error';
+          return { status, reason, repos: [], plans: {}, text: '' };
         }
       },
-      implement: (task) => createOrchestrator(providerName, { approvePlan: async () => true }).run(task),
+      implement: (task, onStage) => createOrchestrator(providerName, { approvePlan: async () => true, onStage }).run(task),
       async publish(task, result, plan) {
         const catalog = loadCatalog();
         const bitbucket = new BitbucketClient();
@@ -631,9 +988,76 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
       }
     }
   );
+  return { watcher, jql, labels };
+}
+
+/**
+ * Webhook mode: Jira pushes "ticket changed" events; each ticket is re-read from Jira and run
+ * through the same label-driven automation as the poller. A slow JQL poll catches missed events.
+ */
+async function runWebhook(args: CliArgs, providerName: string): Promise<void> {
+  const release = acquireWatcherLock();
+  if (!release) {
+    console.error(`A watcher or webhook server is already running (see ${path.join(jobsDir, '.watcher.lock')}).`);
+    process.exitCode = 1;
+    return;
+  }
+  const triggerStatus = await resolveTriggerStatus();
+  const { watcher, jql, labels } = createWatcher({ ...args, dryRun: false }, providerName, triggerStatus);
+  const jira = makeJira();
+  const log = (m: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(m)}`);
+  const reconcileMin = Number(process.env.WEBHOOK_RECONCILE_MINUTES ?? 15);
+  const projects = (process.env.WEBHOOK_PROJECTS || process.env.AUTOMATION_PROJECT || 'T2')
+    .split(',')
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  try {
+    const server = await startWebhookServer({
+      secret: process.env.JIRA_WEBHOOK_SECRET || '',
+      port: Number(process.env.WEBHOOK_PORT) || 8080,
+      host: process.env.WEBHOOK_HOST || '0.0.0.0',
+      projects,
+      log,
+      process: async (key) => {
+        const { action, detail } = await watcher.runTicket(key);
+        return `${action}${detail ? ` (${detail})` : ''}`;
+      },
+      reconcile: async () => (await jira.searchTasks(jql, 50)).map((t) => t.id),
+      reconcileIntervalMs: reconcileMin > 0 ? reconcileMin * 60 * 1000 : 0
+    });
+    console.log(`Webhook server listening on port ${server.port}: POST /webhooks/jira  (health: GET /healthz)`);
+    console.log(`Projects: ${projects.join(', ')} | triggers: labels "${labels.ready}" / "${labels.approved}" | AI: ${providerName}`);
+    console.log(reconcileMin > 0 ? `Safety-net poll every ${reconcileMin} min: ${jql}` : 'Safety-net poll disabled.');
+
+    await new Promise<void>((resolve) => {
+      let stopping = false;
+      onStopSignal(() => {
+        if (stopping) process.exit(130);
+        stopping = true;
+        console.log('\nStopping: no new events; finishing the ticket in progress (Ctrl+C again to force).');
+        void server.close().then(resolve);
+      });
+    });
+  } finally {
+    release();
+  }
+}
+
+async function runWatch(args: CliArgs, providerName: string): Promise<void> {
+  const release = args.dryRun ? () => {} : acquireWatcherLock();
+  if (!release) {
+    console.error(`Another watcher is already running (see ${path.join(jobsDir, '.watcher.lock')}).`);
+    process.exitCode = 1;
+    return;
+  }
+
+  const triggerStatus = await resolveTriggerStatus();
+  const { watcher, jql, labels } = createWatcher(args, providerName, triggerStatus);
 
   console.log(`Watching Jira with: ${jql}`);
-  console.log(`AI: ${providerName} | start: label "${labels.ready}"${summaryTag ? ` or "${summaryTag}" in the summary` : ''} | approval: ${process.env.AUTO_APPROVE_PLAN === 'true' ? 'AUTO (no human gate)' : `label "${labels.approved}" or comment /approve`} | retry a stopped ticket: comment /retry${args.dryRun ? ' | DRY RUN (no Jira writes, no AI runs)' : ''}`);
+  if (triggerStatus) console.log(`Status triggers: entering "${triggerStatus.plan}" starts planning, entering "${triggerStatus.implement}" approves and starts coding (labels also work).`);
+  console.log(`AI: ${providerName} | start: label "${labels.ready}" | approval: ${process.env.AUTO_APPROVE_PLAN === 'true' ? 'AUTO (no human gate)' : `label "${labels.approved}"`} | coding: ${pipelineConfig().coding.enabled ? 'on' : 'OFF (config/pipeline.yaml coding.enabled)'}${args.dryRun ? ' | DRY RUN (no Jira writes, no AI runs)' : ''}`);
   try {
     if (args.once || args.dryRun) {
       const report = await watcher.runOnce();
@@ -642,7 +1066,7 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
       return;
     }
     let stopping = false;
-    process.on('SIGINT', () => {
+    onStopSignal(() => {
       if (stopping) process.exit(130);
       stopping = true;
       console.log('\nStopping after the current cycle (Ctrl+C again to force).');
@@ -681,6 +1105,12 @@ async function main() {
     return;
   }
 
+  if (args.sessions) {
+    const sessions = new FileSessionStore(jobsDir).list();
+    if (!sessions.length) console.log('No sessions yet.');
+    for (const s of sessions) console.log(`${s.ticket.padEnd(10)} ${s.phase.padEnd(12)} ${s.updatedAt}  ${s.detail ?? ''}`.slice(0, 160));
+    return;
+  }
   if (args.status || args.unlock) {
     const store = new JobStore({ jobsDir });
     if (args.unlock) {
@@ -694,9 +1124,14 @@ async function main() {
       );
       return;
     }
+    const session = new FileSessionStore(jobsDir).get(args.status!);
+    if (session) {
+      console.log(`${session.ticket}: phase ${session.phase}${session.detail ? ` (${session.detail})` : ''}, updated ${session.updatedAt}`);
+      for (const h of session.history.slice(-10)) console.log(`  ${h.at}  ${h.phase}${h.detail ? ` — ${h.detail.slice(0, 120)}` : ''}`);
+    }
     const job = store.read(args.status!);
     if (!job) {
-      console.log(`No job found for ${args.status}.`);
+      if (!session) console.log(`No session or job found for ${args.status}.`);
       return;
     }
     const lock = store.readLock(job.ticketId);
@@ -724,6 +1159,10 @@ async function main() {
   console.log(`Repositories Path:  ${repoRoot}`);
   console.log('='.repeat(60));
 
+  if (args.webhook) {
+    await runWebhook(args, providerName);
+    return;
+  }
   if (args.watch) {
     await runWatch(args, providerName);
     return;
@@ -749,6 +1188,8 @@ async function main() {
     return;
   }
 
+  // The demo runs on the dummy sample repos, never on the real catalog.
+  catalogPath = sampleCatalogPath;
   const orchestrator = createOrchestrator(providerName);
 
   const sampleTask: TaskInput = {
@@ -794,3 +1235,4 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.a
     process.exit(1);
   });
 }
+

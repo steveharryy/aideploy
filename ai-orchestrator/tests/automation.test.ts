@@ -94,14 +94,19 @@ describe('AutomationWatcher', () => {
     expect(calls.implement).toHaveLength(0);
     expect(jira.comments[0].pre).toBe('CHANGE PLAN TEXT');
     expect(jira.comments[0].lines.join(' ')).toMatch(/add the label "ai-approved"/);
-    expect(jira.labelOps).toEqual([{ key: 'T2-1', add: [L.planPending], remove: [L.ready] }]);
+    // Only the human trigger is removed; no system label is added. The phase is in our store.
+    // Claimed first (label removed before any AI work), then the phase change removes nothing new.
+    expect(jira.labelOps[0]).toEqual({ key: 'T2-1', add: [], remove: [L.ready] });
+    expect(jira.labelOps.every((op) => op.add.length === 0)).toBe(true);
+    expect(watcher.sessions.get('T2-1')?.phase).toBe('plan_review');
+    expect(watcher.sessions.get('T2-1')?.history.map((h) => h.phase)).toEqual(['planning', 'plan_review']);
     expect(watcher.readPlan('T2-1')?.plans.gb.summary).toBe('do it');
   });
 
   it('ai-approved → implements with the approved plan, opens a PR, comments the link', async () => {
     const { watcher, jira, calls } = setup([ticket('T2-1', [L.ready])]);
     await watcher.runOnce(); // plan
-    jira.tickets = [ticket('T2-1', [L.planPending, L.approved])];
+    jira.tickets = [ticket('T2-1', [L.approved])];
 
     const report = await watcher.runOnce();
 
@@ -111,15 +116,17 @@ describe('AutomationWatcher', () => {
     const last = jira.comments.at(-1)!.lines.join('\n');
     expect(last).toContain('https://bitbucket.org/ws/gb/pull-requests/7');
     expect(last).toMatch(/nothing is merged or deployed automatically/);
-    expect(jira.labelOps).toContainEqual({ key: 'T2-1', add: [L.inProgress], remove: [L.approved, L.planPending, L.needsHuman] });
-    expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [L.prRaised], remove: [L.inProgress] });
+    expect(jira.labelOps).toContainEqual({ key: 'T2-1', add: [], remove: [L.approved] });
+    expect(jira.labelOps.every((op) => op.add.length === 0)).toBe(true);
+    expect(watcher.sessions.get('T2-1')?.phase).toBe('pr_open');
+    expect(watcher.sessions.get('T2-1')?.history.map((h) => h.phase)).toEqual(['planning', 'plan_review', 'coding', 'pr_open']);
     expect(watcher.readPlan('T2-1')?.approvedBy).toBe('Tech Lead');
   });
 
   it('a waiting ticket (plan pending, not approved) is left alone', async () => {
-    const { watcher, jira, calls } = setup([ticket('T2-1', [L.planPending])]);
+    const { watcher, jira, calls } = setup([ticket('T2-1', ['some-other-label'])]);
     const report = await watcher.runOnce();
-    expect(report.actions[0].action).toBe('waiting-approval');
+    expect(report.actions[0].action).toBe('skipped');
     expect(calls.plan + calls.implement.length).toBe(0);
     expect(jira.comments).toHaveLength(0);
   });
@@ -139,7 +146,8 @@ describe('AutomationWatcher', () => {
       });
       const report = await watcher.runOnce();
       expect(report.actions[0].action).toBe(action);
-      expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [L.needsHuman], remove: [L.ready] });
+      expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [], remove: [L.ready] });
+      expect(watcher.sessions.get('T2-1')?.phase).toBe('needs_human');
       expect(jira.comments).toHaveLength(1);
     }
   });
@@ -161,7 +169,8 @@ describe('AutomationWatcher', () => {
     expect(report.actions[0].action).toBe('failed');
     expect(calls.publish).toBe(0);
     expect(jira.comments.at(-1)!.pre).toContain('AssertionError: expected 2 to be 1');
-    expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [L.needsHuman], remove: [L.inProgress] });
+    expect(watcher.sessions.get('T2-1')?.phase).toBe('needs_human');
+    expect(watcher.sessions.get('T2-1')?.detail).toMatch(/TEST_FAILED/);
   });
 
   it('stops at the retry limit', async () => {
@@ -183,7 +192,7 @@ describe('AutomationWatcher', () => {
     const report = await watcher.runOnce();
     expect(report.actions[0].action).toBe('implemented-no-pr');
     expect(jira.comments.at(-1)!.lines.join(' ')).toContain('not a git clone');
-    expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [L.done], remove: [L.inProgress] });
+    expect(watcher.sessions.get('T2-1')?.phase).toBe('done');
   });
 
   it('auto-approve mode goes straight from ai-ready to implementation', async () => {
@@ -195,19 +204,27 @@ describe('AutomationWatcher', () => {
   });
 
   it('dry run: reports what would happen without any Jira write or AI call', async () => {
-    const { watcher, jira, calls } = setup([ticket('T2-1', [L.ready]), ticket('T2-2', [L.planPending])], {}, { dryRun: true });
+    const { watcher, jira, calls } = setup([ticket('T2-1', [L.ready]), ticket('T2-2', ['other'])], {}, { dryRun: true });
     const report = await watcher.runOnce();
-    expect(report.actions.map((a) => a.action)).toEqual(['planned', 'waiting-approval']);
+    expect(report.actions.map((a) => a.action)).toEqual(['planned', 'skipped']);
     expect(calls.plan + calls.implement.length + calls.publish).toBe(0);
     expect(jira.comments.length + jira.labelOps.length).toBe(0);
+    expect(watcher.sessions.list()).toEqual([]);
   });
 
-  it('moves the Jira status only when configured', async () => {
-    const { watcher, jira } = setup([ticket('T2-1', [L.ready])], {}, { statusInProgress: 'In Progress', statusInReview: 'In Review' });
+  it('moves the Jira status to the mapped existing workflow status, only for mapped phases', async () => {
+    const map: Record<string, string> = { plan_review: 'Pending Approval', coding: 'Dev in Progress' };
+    const { watcher, jira } = setup([ticket('T2-1', [L.ready])], {}, { statusForPhase: (_t, phase) => map[phase] });
     await watcher.runOnce();
     jira.tickets = [ticket('T2-1', [L.approved])];
     await watcher.runOnce();
-    expect(jira.transitions).toEqual(['T2-1->In Progress', 'T2-1->In Review']);
+    expect(jira.transitions).toEqual(['T2-1->Pending Approval', 'T2-1->Dev in Progress']);
+  });
+
+  it('no status mapping: Jira status is never touched', async () => {
+    const { watcher, jira } = setup([ticket('T2-1', [L.ready])]);
+    await watcher.runOnce();
+    expect(jira.transitions).toEqual([]);
   });
 
   it('PR description contains ticket, approved plan, files and verify results', () => {
@@ -256,134 +273,46 @@ describe('AutomationWatcher', () => {
   });
 });
 
-describe('AutomationWatcher: no-Labels-field workflow (summary tag + comment approval)', () => {
-  const cfg = { summaryTag: 'ai-ready', approveCommand: '/approve', rejectCommand: '/reject' };
-  const withSummary = (id: string, title: string, labels: string[] = [], comments: Array<{ author: string; created: string; body: string }> = []): TaskInput => ({
-    ...ticket(id, labels),
-    title,
-    metadata: { labels, comments, url: `https://x/browse/${id}` }
-  });
-
-  it('"ai-ready" in the summary starts planning and sets the real label', async () => {
-    const { watcher, jira, calls } = setup([withSummary('T2-1', '/v2/events off-by-one ai-ready')], {}, cfg);
-    const report = await watcher.runOnce();
-    expect(report.actions[0].action).toBe('planned');
-    expect(calls.plan).toBe(1);
-    expect(jira.labelOps[0]).toEqual({ key: 'T2-1', add: [L.ready], remove: [] });
-    expect(jira.comments[0].lines.join(' ')).toContain('comment "/approve"');
-  });
-
-  it('the summary tag is ignored once the bot has moved the ticket on (no re-planning loop)', async () => {
-    const { watcher, calls } = setup([withSummary('T2-1', 'Fix it [ai-ready]', [L.done])], {}, cfg);
-    expect((await watcher.runOnce()).actions[0].action).toBe('skipped');
-    expect(calls.plan).toBe(0);
-  });
-
-  it('only matches the tag as a word', async () => {
-    const { watcher, calls } = setup([withSummary('T2-1', 'Make the API ready for launch'), withSummary('T2-2', 'ai-readyness check')], {}, cfg);
-    expect((await watcher.runOnce()).actions.map((a) => a.action)).toEqual(['skipped', 'skipped']);
-    expect(calls.plan).toBe(0);
-  });
-
-  it('a human "/approve" comment after the plan approves and starts coding (approver recorded)', async () => {
-    const { watcher, jira, calls } = setup([withSummary('T2-1', 'Fix ai-ready')], {}, cfg);
-    await watcher.runOnce(); // plan posted
-    const later = new Date(Date.now() + 60_000).toISOString().replace('Z', '+0000');
-    jira.tickets = [withSummary('T2-1', 'Fix ai-ready', [L.planPending], [{ author: 'Abhay', created: later, body: '/approve looks good' }])];
-
-    const report = await watcher.runOnce();
-
-    expect(report.actions[0].action).toBe('implemented-pr');
-    expect(calls.implement).toHaveLength(1);
-    expect(watcher.readPlan('T2-1')?.approvedBy).toBe('Abhay');
-    expect(jira.labelOps).toContainEqual({ key: 'T2-1', add: [L.approved], remove: [] });
-  });
-
-  it('ignores comments from before the plan and the bot\'s own comments', async () => {
-    const { watcher, jira, calls } = setup([withSummary('T2-1', 'Fix ai-ready')], {}, cfg);
-    await watcher.runOnce();
-    jira.tickets = [
-      withSummary('T2-1', 'Fix ai-ready', [L.planPending], [
-        { author: 'Abhay', created: '2020-01-01T00:00:00.000+0530', body: '/approve' },
-        { author: 'Bot', created: new Date(Date.now() + 60_000).toISOString(), body: '🤖 AI Orchestrator /approve' }
-      ])
-    ];
-    expect((await watcher.runOnce()).actions[0].action).toBe('waiting-approval');
-    expect(calls.implement).toHaveLength(0);
-  });
-
-  it('"/reject" stops the ticket without changing anything', async () => {
-    const { watcher, jira, calls } = setup([withSummary('T2-1', 'Fix ai-ready')], {}, cfg);
-    await watcher.runOnce();
-    jira.tickets = [withSummary('T2-1', 'Fix ai-ready', [L.planPending], [{ author: 'Lead', created: new Date(Date.now() + 60_000).toISOString(), body: '/reject wrong repo' }])];
-    expect((await watcher.runOnce()).actions[0].action).toBe('rejected');
-    expect(calls.implement).toHaveLength(0);
-    expect(jira.labelOps.at(-1)).toEqual({ key: 'T2-1', add: [L.needsHuman], remove: [L.planPending] });
-  });
-
-  it('"/retry" on a stopped (needs-human) ticket re-runs the approved plan; only if posted after the bot\'s last comment', async () => {
-    const retryCfg = { ...cfg, retryCommand: '/retry' };
-    const { watcher, jira, calls } = setup([withSummary('T2-1', 'Fix ai-ready')], {}, retryCfg);
-    await watcher.runOnce(); // plan posted and saved
-    const t = (min: number) => new Date(Date.now() + min * 60_000).toISOString().replace('Z', '+0000');
-    const stopped = '🤖 AI Orchestrator\nImplementation stopped: EXECUTION_FAILED.';
-
-    // A "/retry" from BEFORE the failure comment does not count.
-    jira.tickets = [withSummary('T2-1', 'Fix ai-ready', [L.needsHuman], [
-      { author: 'Abhay', created: t(1), body: '/retry' },
-      { author: 'Bot', created: t(2), body: stopped }
-    ])];
-    expect((await watcher.runOnce()).actions[0].action).toBe('skipped');
-    expect(calls.implement).toHaveLength(0);
-
-    // A "/retry" AFTER it re-runs the implementation with the approved plan.
-    jira.tickets = [withSummary('T2-1', 'Fix ai-ready', [L.needsHuman], [
-      { author: 'Bot', created: t(2), body: stopped },
-      { author: 'Abhay', created: t(3), body: '/retry' }
-    ])];
-    const report = await watcher.runOnce();
-    expect(report.actions[0].action).toBe('implemented-pr');
-    expect(calls.implement).toHaveLength(1);
-    expect(calls.implement[0].metadata?.approvedPlans).toEqual({ gb: { summary: 'do it' } });
-    expect(jira.labelOps).toContainEqual({ key: 'T2-1', add: [L.approved], remove: [L.needsHuman] });
-  });
-
+describe('AutomationWatcher: retry after a failure', () => {
   it('the failure comment tells the user how to retry', async () => {
     const failing = { ...okResult('T2-1'), success: false, status: 'EXECUTION_FAILED' as const, error: 'boom' };
-    const { watcher, jira } = setup([ticket('T2-1', [L.approved])], { implement: async () => failing }, { retryCommand: '/retry' });
+    const { watcher, jira } = setup([ticket('T2-1', [L.approved])], { implement: async () => failing });
     // An approved ticket needs a plan on record first.
     fs.mkdirSync(path.join((watcher as any).deps.jobsDir, 'T2-1'), { recursive: true });
     fs.writeFileSync(path.join((watcher as any).deps.jobsDir, 'T2-1', 'plan.json'), JSON.stringify({ ticketId: 'T2-1', createdAt: new Date().toISOString(), repos: ['gb'], plans: {}, text: 'P' }));
     expect((await watcher.runOnce()).actions[0].action).toBe('failed');
-    expect(jira.comments.at(-1)!.lines.join(' ')).toContain('comment "/retry"');
+    expect(jira.comments.at(-1)!.lines.join(' ')).toContain('add the label "ai-approved" again');
   });
 });
 
 describe('BitbucketClient', () => {
   it('refuses to push anything but ai/* branches', async () => {
     const git: string[][] = [];
-    const bb = new BitbucketClient({ token: 't', git: async (_c, a) => (git.push(a), '') });
+    const envs: Array<Record<string, string> | undefined> = [];
+    const bb = new BitbucketClient({ token: 't', git: async (_c, a, env) => (git.push(a), envs.push(env), '') });
     await expect(bb.pushBranch('/w', 'main', { workspace: 'ws', repo: 'r' })).rejects.toThrow(/only ai\/\* ticket branches/);
     await expect(bb.pushBranch('/w', 'develop', { workspace: 'ws', repo: 'r' })).rejects.toThrow();
     await bb.pushBranch('/w', 'ai/t2-547', { workspace: 'ws', repo: 'r' });
     const b64 = (s: string) => Buffer.from(s).toString('base64');
-    expect(git[0]).toEqual(['-c', `http.extraHeader=Authorization: Basic ${b64('x-token-auth:t')}`, 'push', 'https://bitbucket.org/ws/r.git', 'ai/t2-547:ai/t2-547']);
-    expect(git[0][3]).toBe('https://bitbucket.org/ws/r.git'); // credentials never in the URL
+    expect(git[0]).toEqual(['push', 'https://bitbucket.org/ws/r.git', 'ai/t2-547:ai/t2-547']);
+    // The token travels in the environment, never on the command line (errors and `ps` show argv)
+    expect(git[0].join(' ')).not.toMatch(/Basic|Bearer|Authorization|x-token-auth/);
+    expect(envs[0]).toEqual({ GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'http.extraHeader', GIT_CONFIG_VALUE_0: `Authorization: Basic ${b64('x-token-auth:t')}` });
   });
 
   it('git push with an API token uses the x-bitbucket-api-token-auth username, not the email', async () => {
-    const git: string[][] = [];
-    const bb = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api', git: async (_c, a) => (git.push(a), '') });
+    const envs: Array<Record<string, string> | undefined> = [];
+    const bb = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api', git: async (_c, _a, env) => (envs.push(env), '') });
     await bb.pushBranch('/w', 'ai/t2-587', { workspace: 'ws', repo: 'r' });
-    expect(git[0][1]).toBe(`http.extraHeader=Authorization: Basic ${Buffer.from('x-bitbucket-api-token-auth:api').toString('base64')}`);
-    expect(git[0].join(' ')).not.toContain(Buffer.from('dev@example.com:api').toString('base64'));
+    expect(envs[0]?.GIT_CONFIG_VALUE_0).toBe(`Authorization: Basic ${Buffer.from('x-bitbucket-api-token-auth:api').toString('base64')}`);
+    expect(JSON.stringify(envs[0])).not.toContain(Buffer.from('dev@example.com:api').toString('base64'));
   });
 
-  it('fetch credentials are scoped to bitbucket.org only (never sent to another remote)', () => {
-    const args = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api' }).gitRemoteArgs();
-    expect(args[0]).toBe('-c');
-    expect(args[1].startsWith('http.https://bitbucket.org/.extraHeader=Authorization: Basic ')).toBe(true);
-    expect(new BitbucketClient({ token: '', email: '', apiToken: '' }).gitRemoteArgs()).toEqual([]);
+  it('fetch credentials are scoped to bitbucket.org only and passed in the environment', () => {
+    const env = new BitbucketClient({ email: 'dev@example.com', apiToken: 'api' }).gitRemoteEnv();
+    expect(env.GIT_CONFIG_KEY_0).toBe('http.https://bitbucket.org/.extraHeader');
+    expect(env.GIT_CONFIG_VALUE_0.startsWith('Authorization: Basic ')).toBe(true);
+    expect(new BitbucketClient({ token: '', email: '', apiToken: '' }).gitRemoteEnv()).toEqual({});
   });
 
   it('creates a PR with the right payload, or reuses an open one', async () => {
@@ -469,5 +398,29 @@ describe('Jira write-back', () => {
       )
     );
     expect(await jira.getLabelAdder('T2-1', 'ai-approved')).toBe('Tech Lead');
+  });
+});
+
+describe('Jira comment format (ADF)', () => {
+  it('puts version at the top level of the doc, as Jira requires (attrs.version is rejected with INVALID_INPUT)', () => {
+    const doc = commentAdf(['line one', '', 'line two'], 'PLAN') as unknown as Record<string, unknown>;
+    expect(doc.type).toBe('doc');
+    expect(doc.version).toBe(1);
+    expect(doc.attrs).toBeUndefined();
+    expect((doc.content as Array<{ type: string }>).map((n) => n.type)).toEqual(['paragraph', 'paragraph', 'codeBlock']);
+  });
+});
+
+describe('Temporary AI failures are retried, not handed to a person', () => {
+  it('retry-later keeps the trigger label, posts nothing and records the wait', async () => {
+    const { watcher, jira } = setup([ticket('T2-1', [L.ready])], {
+      plan: async () => ({ status: 'retry-later', reason: "You've hit your session limit", repos: [], plans: {}, text: '' })
+    });
+    const report = await watcher.runOnce();
+    expect(report.actions[0].action).toBe('skipped');
+    expect(jira.comments).toHaveLength(0);
+    // claimed, then put back for the next cycle
+    expect(jira.labelOps).toEqual([{ key: 'T2-1', add: [], remove: [L.ready] }, { key: 'T2-1', add: [L.ready], remove: [] }]);
+    expect(watcher.sessions.get('T2-1')?.detail).toMatch(/waiting to retry/);
   });
 });

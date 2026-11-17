@@ -4,6 +4,8 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { TaskInput } from '../models/types.js';
 
+import { safeErrorMessage } from '../util/redact.js';
+
 const execFileAsync = promisify(execFile);
 
 /** Where one repo's work for one ticket happens. */
@@ -28,8 +30,8 @@ export interface GitWorkspaceConfig {
   worktreesDir?: string;
   /** Branch name prefix (default "ai/"). */
   branchPrefix?: string;
-  /** Extra `git -c ...` args for talking to the remote (e.g. a host-scoped auth header for fetch). */
-  remoteGitArgs?: () => string[];
+  /** Extra environment for talking to the remote (e.g. a host-scoped auth header for fetch, via GIT_CONFIG_*). */
+  remoteGitEnv?: () => Record<string, string>;
   log?: (message: string) => void;
 }
 
@@ -42,9 +44,9 @@ export const NEVER_COMMIT = [
   ':(exclude,glob)**/.env.*'
 ];
 
-async function git(cwd: string, args: string[]): Promise<string> {
+async function git(cwd: string, args: string[], extraEnv: Record<string, string> = {}): Promise<string> {
   // No interactive credential prompts: a missing login must fail fast, not hang the watcher.
-  const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0' } });
+  const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 10 * 1024 * 1024, env: { ...process.env, GIT_TERMINAL_PROMPT: '0', ...extraEnv } });
   return stdout.trim();
 }
 
@@ -63,13 +65,13 @@ async function git(cwd: string, args: string[]): Promise<string> {
 export class GitWorkspaceManager implements IWorkspaceManager {
   private worktreesDir: string;
   private branchPrefix: string;
-  private remoteGitArgs: () => string[];
+  private remoteGitEnv: () => Record<string, string>;
   private log: (message: string) => void;
 
   constructor(config: GitWorkspaceConfig = {}) {
     this.worktreesDir = config.worktreesDir || path.resolve(process.cwd(), '.worktrees');
     this.branchPrefix = config.branchPrefix ?? 'ai/';
-    this.remoteGitArgs = config.remoteGitArgs ?? (() => []);
+    this.remoteGitEnv = config.remoteGitEnv ?? (() => ({}));
     this.log = config.log ?? (() => {});
   }
 
@@ -83,9 +85,9 @@ export class GitWorkspaceManager implements IWorkspaceManager {
     if (!remotes.split('\n').includes('origin')) return baseBranch;
     const remoteRef = `refs/remotes/origin/${baseBranch}`;
     try {
-      await git(repoPath, [...this.remoteGitArgs(), 'fetch', '--no-tags', 'origin', `+refs/heads/${baseBranch}:${remoteRef}`]);
+      await git(repoPath, ['fetch', '--no-tags', 'origin', `+refs/heads/${baseBranch}:${remoteRef}`], this.remoteGitEnv());
     } catch (err) {
-      const message = err instanceof Error ? err.message.split('\n')[0] : String(err);
+      const message = safeErrorMessage(err).split('\n')[0];
       this.log(`Could not fetch origin/${baseBranch} (${message}); using the last fetched copy.`);
     }
     const hasRemote = await git(repoPath, ['rev-parse', '--verify', '--quiet', `${remoteRef}^{commit}`]).then(() => true, () => false);

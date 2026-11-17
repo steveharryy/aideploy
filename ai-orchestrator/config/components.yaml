@@ -1,0 +1,30 @@
+# Jira component OR label → repositories. The first thing the Planning Agent uses to pick repos.
+# T2 tags areas with labels instead of components, so a name here can be either.
+# Keep changes reviewed (PR), like code. Override the path with COMPONENT_MAP_PATH.
+#
+#   <Jira component name>:
+#     product:    Jira "Product" value this component belongs to (optional)
+#     repos:      catalog repo ids (catalog/repos.yaml)
+#     risk_floor: low | medium | high. The plan's risk is never rated lower than this.
+#
+# Money-touching components (wallet, payouts, odds, contest rules) should be risk_floor: high.
+
+components:
+  Homepage:
+    product: GameBull
+    repos: [gb-homepage-api]
+    risk_floor: medium
+
+  # T2 area labels seen on recent tickets. Fill in the repo ids (add them to catalog/repos.yaml
+  # first), then set projects.T2.intake.require_component: true in config/pipeline.yaml.
+  # coin-sportsbook:
+  #   repos: [<repo id>]
+  #   risk_floor: high        # odds / bets
+  # betslip:
+  #   repos: [<repo id>]
+  #   risk_floor: high        # stakes / bets
+  # coin-markets:
+  #   repos: [<repo id>]
+  #   risk_floor: high        # odds / markets
+  # gamebull:
+  #   repos: [<repo id>]

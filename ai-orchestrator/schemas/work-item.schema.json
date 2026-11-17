@@ -55,6 +55,15 @@
     },
     "contract": { "type": "string", "description": "Shared contract with other repos (API shapes, message formats). Never changed by the coding agent." },
     "assumptions": { "type": "array", "items": { "type": "string" } },
-    "clarifications": { "type": "array", "items": { "type": "string" }, "description": "Answers to earlier ask_user questions" }
+    "clarifications": { "type": "array", "items": { "type": "string" }, "description": "Answers to earlier ask_user questions" },
+    "baselineFix": {
+      "type": "object",
+      "description": "Approved repair of tests that already fail on the base branch. Only these files (tests or test-runner config, never source) may change for it.",
+      "required": ["files", "reason"],
+      "properties": {
+        "files": { "type": "array", "minItems": 1, "items": { "type": "string" } },
+        "reason": { "type": "string" }
+      }
+    }
   }
 }

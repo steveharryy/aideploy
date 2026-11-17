@@ -3,6 +3,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import os from 'node:os';
 
+/**
+ * Random id of THIS process. A lock with our pid but another instance id was left by an earlier
+ * process that got the same pid (common after a container restart), so it is stale.
+ */
+export const PROCESS_INSTANCE = crypto.randomUUID();
+
 export type StageStatus = 'running' | 'passed' | 'failed' | 'skipped';
 
 export interface JobStage {
@@ -42,6 +48,8 @@ export interface JobState {
 }
 
 interface LockInfo {
+  /** Process instance id (see PROCESS_INSTANCE). */
+  instance?: string;
   runId: string;
   pid: number;
   host: string;
@@ -176,6 +184,8 @@ export class JobStore {
   private isStale(lock: LockInfo): boolean {
     if (Date.now() - Date.parse(lock.startedAt) > this.lockTtlMs) return true;
     if (lock.host !== hostName()) return false; // can't check a pid on another machine
+    // Same pid but another instance: an earlier process that got the same pid (container restart).
+    if (lock.pid === process.pid) return !!lock.instance && lock.instance !== PROCESS_INSTANCE;
     try {
       process.kill(lock.pid, 0); // signal 0 = existence check only
       return false;
@@ -190,6 +200,7 @@ export class JobStore {
     const lock: LockInfo = {
       runId: crypto.randomUUID(),
       pid: process.pid,
+      instance: PROCESS_INSTANCE,
       host: hostName(),
       startedAt: new Date().toISOString()
     };

@@ -1,5 +1,6 @@
 import type { TaskInput } from '../../models/types.js';
 import type { ImplementationPlan } from '../../providers/claude-code-provider.js';
+import { isTestFile } from '../team-agent/repo-agents/test-integrity.js';
 
 /**
  * WorkItem: the contract between the PLANNING agent (produces it) and the CODING agent (consumes it).
@@ -26,6 +27,22 @@ export interface WorkItem {
   assumptions?: string[];
   /** Answers to earlier ask_user questions (filled on re-runs). */
   clarifications?: string[];
+  /**
+   * The approved plan says the repo's existing tests are already broken on the base branch and
+   * must be repaired first. Only these files may change for it, and only test files or
+   * test-runner config (never source). Without this, a red baseline stops the agent.
+   */
+  baselineFix?: { files: string[]; reason: string };
+}
+
+/** Test-runner / build config files (package.json, tsconfig*.json, jest/vitest config, pytest config). */
+export function isTestRunnerConfig(p: string): boolean {
+  return /(^|\/)(package\.json|tsconfig[^/]*\.json|vitest\.config\.[cm]?[jt]s|jest\.config\.[cm]?[jt]s|pytest\.ini|setup\.cfg|pyproject\.toml)$/.test(p);
+}
+
+/** Files a baseline fix may touch: tests and test-runner config, never application source. */
+export function isBaselineFixFile(p: string): boolean {
+  return isTestFile(p) || isTestRunnerConfig(p);
 }
 
 const AC_ID = /^AC-?\d+$/i;
@@ -83,6 +100,16 @@ export function validateWorkItem(input: unknown): string[] {
     }
   }
   if (w.contract !== undefined && typeof w.contract !== 'string') errors.push('"contract" must be a string');
+  if (w.baselineFix !== undefined) {
+    const b = w.baselineFix;
+    if (!b || typeof b !== 'object' || !Array.isArray(b.files) || b.files.length === 0) errors.push('"baselineFix.files" must be a non-empty array');
+    else
+      b.files.forEach((f, i) => {
+        if (typeof f !== 'string' || !f.trim() || f.startsWith('/') || f.split('/').includes('..')) errors.push(`baselineFix.files[${i}] must be a repo-relative path`);
+        else if (!isBaselineFixFile(f)) errors.push(`baselineFix.files[${i}] "${f}" is not a test or test-runner config file (source files are never part of a baseline fix)`);
+      });
+    if (!b || typeof b.reason !== 'string' || !b.reason.trim()) errors.push('"baselineFix.reason" must be a non-empty string');
+  }
   return errors;
 }
 

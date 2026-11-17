@@ -129,6 +129,30 @@ describe('Regression: impact analysis routing', () => {
     expect(coordinated).toEqual(['repo-a']);
   });
 
+  it('a structured plan (Planning Agent) is scoped by approvedRepos, even though its briefs have no filesToChange', async () => {
+    let coordinated: string[] = [];
+    const orchestrator = new Orchestrator({
+      aiProvider: new MockAIProvider(),
+      dedupAgent: new DeduplicationAgent({ repositoriesRoot: root }),
+      impactAgent: new ImpactAnalysisAgent({ repositoriesDir: root }),
+      teamAgent: {
+        coordinate: async (_t, impact) => {
+          coordinated = impact.affectedRepositories;
+          return { success: true, repoResults: [], executionPlan: [] };
+        }
+      },
+      testingAgent: { runTests: async () => ({ overallSuccess: true, summary: 'ok', repoResults: [] }) },
+      silent: true
+    });
+    const t = task('T2-600', 'Payment and order mismatch', 'pay order');
+    t.metadata = {
+      approvedPlans: { 'repo-a': { workItem: { id: 'W1' } }, 'repo-b': { workItem: { id: 'W2' } } },
+      approvedRepos: ['repo-b', 'repo-a']
+    };
+    await orchestrator.run(t);
+    expect(coordinated).toEqual(['repo-b', 'repo-a']);
+  });
+
   it('returns no repositories (no repo-a fallback) when nothing matches', async () => {
     const impact = await new ImpactAnalysisAgent({ repositoriesDir: root }).analyze(
       task('X-2', 'Homepage creators', 'Show NFL creators on homepage')

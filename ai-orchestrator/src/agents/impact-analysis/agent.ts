@@ -57,8 +57,23 @@ export class ImpactAnalysisAgent implements IImpactAnalysisAgent {
       throw new Error('ImpactAnalysisAgent Error: Invalid task input. Task ID and title are required.');
     }
 
-    // Jira labels/components (if present) let tickets route explicitly, e.g. label "repo-b".
     const meta = task.metadata || {};
+
+    // An approved plan decides the repos (the Planning Agent chose them and a human approved).
+    const approvedRepos = meta.approvedRepos;
+    if (Array.isArray(approvedRepos) && approvedRepos.length > 0) {
+      const repos = approvedRepos.map(String);
+      return {
+        taskId: task.id,
+        affectedRepositories: repos,
+        affectedModules: [],
+        affectedFiles: [],
+        confidence: 1,
+        reasoning: `Repositories taken from the approved plan: ${repos.join(', ')}.`
+      };
+    }
+
+    // Jira labels/components (if present) let tickets route explicitly, e.g. label "repo-b".
     const tags = [
       ...(Array.isArray(meta.labels) ? meta.labels : []),
       ...(Array.isArray(meta.components) ? meta.components : [])
