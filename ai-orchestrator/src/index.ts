@@ -93,11 +93,15 @@ function saveCodingReport(report: CodingReport, diff: string): void {
   else fs.rmSync(diffFile, { force: true });
 }
 
-function makeCodingAgentProvider(catalog: ServiceCatalog | undefined): CodingAgentProvider {
+function makeCodingAgentProvider(catalog: ServiceCatalog | undefined, knownFailures?: Map<string, string[]>): CodingAgentProvider {
   return new CodingAgentProvider({
     verifyFor: (id) => catalog?.verifyCommands(id) ?? [],
     purposeFor: (id) => catalog?.get(id)?.purpose,
-    onReport: saveCodingReport,
+    onReport: (report, diff) => {
+      saveCodingReport(report, diff);
+      // The re-test after coding must not block on tests that already failed before the change.
+      if (report.preExistingFailures) knownFailures?.set(report.repo, report.preExistingFailures.tests);
+    },
     agent: { log: (m) => console.log(m) }
   });
 }
@@ -129,6 +133,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
   // handoff  = change set prepared by an external agent, applied through the same guards
   // Fail loudly on anything else rather than silently running a different provider.
   const providerKey = chosenProvider.toLowerCase();
+  // Per run: repo → tests already failing on its base branch (filled by the coding agent's baseline).
+  const knownFailures = new Map<string, string[]>();
   if (!PROVIDERS.includes(providerKey)) {
     throw new Error(`Unsupported AI_PROVIDER "${chosenProvider}". Use one of: ${PROVIDERS.join(', ')}.`);
   }
@@ -138,7 +144,7 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
       : providerKey === 'claude-code'
         ? makeClaudeCodeProvider(catalog)
         : providerKey === 'coding-agent'
-          ? makeCodingAgentProvider(catalog)
+          ? makeCodingAgentProvider(catalog, knownFailures)
         : providerKey === 'handoff'
           ? new HandoffProvider()
           : new MockAIProvider();
@@ -166,7 +172,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
     testingAgent: new TestingAgent({
       repositoriesRoot: repoRoot,
       repoPaths,
-      ...(catalog ? { verifyCommands: (id: string) => catalog.verifyCommands(id) } : {})
+      ...(catalog ? { verifyCommands: (id: string) => catalog.verifyCommands(id) } : {}),
+      knownFailures: (id: string) => knownFailures.get(id)
     }),
     // One run per ticket + persisted stage history in .jobs/<ticket>/job.json
     jobStore: new JobStore({ jobsDir }),

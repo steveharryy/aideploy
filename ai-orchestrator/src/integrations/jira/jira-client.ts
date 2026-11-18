@@ -244,15 +244,26 @@ export class JiraClient {
   }
 
   /**
+   * The NEWEST changelog entries (up to 100), oldest first. Jira returns the changelog oldest first,
+   * so a long history needs a second call for its last page; otherwise recent moves are never seen.
+   */
+  private async recentChangelog<T>(issueKey: string): Promise<T[]> {
+    const base = `/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?maxResults=100`;
+    const first = await this.request<{ values?: T[]; total?: number }>(base);
+    const total = first.total ?? 0;
+    if (total <= 100) return first.values || [];
+    const last = await this.request<{ values?: T[] }>(`${base}&startAt=${total - 100}`);
+    return last.values || [];
+  }
+
+  /**
    * When, and by whom, the ticket most recently moved INTO the given status (from the changelog).
    * Used for status-driven triggers: who approved the plan, and whether this entry was already handled.
    */
   async getStatusEntry(issueKey: string, statusName: string): Promise<{ by?: string; at?: string } | undefined> {
-    const data = await this.request<{
-      values?: Array<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; toString?: string | null }> }>;
-    }>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?maxResults=100`);
+    const values = await this.recentChangelog<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; toString?: string | null }> }>(issueKey);
     const wanted = statusName.trim().toLowerCase();
-    const entries = (data.values || []).filter((v) =>
+    const entries = values.filter((v) =>
       (v.items || []).some((i) => i.field === 'status' && (i.toString || '').trim().toLowerCase() === wanted)
     );
     const last = entries[entries.length - 1];
@@ -269,10 +280,8 @@ export class JiraClient {
 
   /** Who most recently added a label (from the changelog), e.g. the approver of "ai-approved". */
   async getLabelAdder(issueKey: string, label: string): Promise<string | undefined> {
-    const data = await this.request<{
-      values?: Array<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; fromString?: string | null; toString?: string | null }> }>;
-    }>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?maxResults=100`);
-    const added = (data.values || []).filter((v) =>
+    const values = await this.recentChangelog<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; fromString?: string | null; toString?: string | null }> }>(issueKey);
+    const added = values.filter((v) =>
       (v.items || []).some(
         (i) =>
           i.field === 'labels' &&

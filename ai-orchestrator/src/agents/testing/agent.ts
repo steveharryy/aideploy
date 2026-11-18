@@ -4,6 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { RepoTestResult, TestCheckResult, TestingResult } from '../../models/types.js';
 import type { VerifyCommand } from '../../catalog/service-catalog.js';
+import { newFailures } from '../../util/test-failures.js';
 
 const execAsync = promisify(exec);
 
@@ -14,6 +15,12 @@ export interface TestingAgentConfig {
   /** Verify contract per repo (e.g. from the service catalog). */
   verifyCommands?: (repoId: string) => VerifyCommand[];
   customTestRunner?: (repoId: string, repoPath: string) => Promise<RepoTestResult>;
+  /**
+   * Tests already failing on the base branch for this repo (from the coding agent's baseline).
+   * A test step that fails only on these counts as passed (workflow rule: pre-existing failures
+   * are not blocking). Undefined = none known, any failure blocks.
+   */
+  knownFailures?: (repoId: string) => string[] | undefined;
 }
 
 export interface ITestingAgent {
@@ -34,12 +41,14 @@ export class TestingAgent implements ITestingAgent {
   private repoPaths: Record<string, string>;
   private verifyCommands?: (repoId: string) => VerifyCommand[];
   private customTestRunner?: (repoId: string, repoPath: string) => Promise<RepoTestResult>;
+  private knownFailures?: (repoId: string) => string[] | undefined;
 
   constructor(config: TestingAgentConfig = {}) {
     this.repositoriesRoot = config.repositoriesRoot || path.resolve(process.cwd(), 'repositories');
     this.repoPaths = config.repoPaths || {};
     this.verifyCommands = config.verifyCommands;
     this.customTestRunner = config.customTestRunner;
+    this.knownFailures = config.knownFailures;
   }
 
   async runTests(affectedRepos: string[], workdirs: Record<string, string> = {}): Promise<TestingResult> {
@@ -107,9 +116,20 @@ export class TestingAgent implements ITestingAgent {
     // 2a. Verify contract from the service catalog: every command must pass.
     const contract = this.verifyCommands?.(repoId) || [];
     if (contract.length > 0) {
+      const known = this.knownFailures?.(repoId);
       for (const cmd of contract) {
-        checks.push(await this.runCheck(`verify:${cmd.name}`, cmd.run, repoPath, (cmd.timeoutSec ?? 600) * 1000));
-        if (!checks[checks.length - 1].passed) break; // stop at the first failing step
+        const check = await this.runCheck(`verify:${cmd.name}`, cmd.run, repoPath, (cmd.timeoutSec ?? 600) * 1000);
+        if (!check.passed && known?.length && /\btest\b/i.test(`${cmd.name} ${cmd.run}`)) {
+          const fresh = newFailures(`${check.output ?? ''}\n${check.error ?? ''}`, known);
+          if (fresh && fresh.length === 0) {
+            check.passed = true;
+            check.output = `Only tests that already failed on the base branch still fail (${known.length}); not blocking.\n${check.output ?? ''}`;
+          } else if (fresh) {
+            check.error = `New failures caused by the change: ${fresh.join('; ')}\n${check.error ?? ''}`;
+          }
+        }
+        checks.push(check);
+        if (!check.passed) break; // stop at the first failing step
       }
       return this.summarize(repoId, checks);
     }

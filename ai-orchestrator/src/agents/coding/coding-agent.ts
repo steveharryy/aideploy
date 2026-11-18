@@ -34,6 +34,7 @@ import {
   type TreeChange
 } from './gates.js';
 import { isBaselineFixFile, normaliseAcId, validateWorkItem, type WorkItem } from './work-item.js';
+import { failingTests, newFailures } from '../../util/test-failures.js';
 
 export interface CodingAgentConfig {
   runner?: ClaudeCodeRunner;
@@ -83,7 +84,13 @@ export interface CodingReport {
   testsFirst: { baselinePassed: boolean; files: string[]; failedBeforeChange: boolean };
   /** Set when the approved plan's baseline fix was applied: why, and which files changed for it. */
   baselineFix?: { reason: string; files: string[]; reverted: string[] };
-  checks: Array<{ name: string; passed: boolean; durationMs: number; log?: string }>;
+  /**
+   * Tests that already failed on the base branch before any change (workflow rule: not blocking).
+   * Later runs only block on tests NOT in this list.
+   */
+  preExistingFailures?: { step: string; tests: string[] };
+  /** `tolerated`: the step failed only on pre-existing failures, so it counts as passed. */
+  checks: Array<{ name: string; passed: boolean; durationMs: number; log?: string; tolerated?: string[] }>;
   scope: {
     changedFiles: string[];
     outOfPlan: Array<{ path: string; reason?: string }>;
@@ -224,6 +231,33 @@ export class CodingAgent {
       const r = await this.exec(sandbox, cmd.run, (cmd.timeoutSec ?? 0) * 1000 || this.commandTimeoutMs, env);
       return r;
     };
+    // Tests failing on the base branch before any change (none = the baseline was green).
+    let preExisting: Set<string> | undefined;
+    /**
+     * Like runAll, but a test step that fails ONLY on pre-existing failures counts as passed (and says
+     * so). A new failure blocks, and its log names the new failures first so the coder fixes those.
+     */
+    const runChecks = async (steps: VerifyCommand[]) => {
+      const results: CodingReport['checks'] = [];
+      for (const step of steps) {
+        const r = await run(step);
+        let passed = r.code === 0;
+        let tolerated: string[] | undefined;
+        let note = '';
+        if (!passed && step === testStep && preExisting) {
+          const fresh = newFailures(r.output, preExisting);
+          if (fresh && fresh.length === 0) {
+            passed = true;
+            tolerated = failingTests(r.output);
+          } else if (fresh) {
+            note = `New failures caused by the change (fix these):\n${fresh.map((t) => `- ${t}`).join('\n')}\n(${preExisting.size} test(s) were already failing before the change; ignore those.)\n\n`;
+          }
+        }
+        results.push({ name: step.name, passed, durationMs: r.durationMs, ...(!passed ? { log: note + trimLog(r.output) } : {}), ...(tolerated ? { tolerated } : {}) });
+        if (!passed) break; // stop at the first failing step
+      }
+      return results;
+    };
     const runAll = async (steps: VerifyCommand[]) => {
       const results: CodingReport['checks'] = [];
       for (const step of steps) {
@@ -363,13 +397,31 @@ export class CodingAgent {
       // proves something, and a later failure (e.g. a type error) is the change's fault, not
       // a pre-existing problem the agent would burn its fix rounds on. ──
       this.log(`[${w.repo}] baseline: ${baselineSteps().map((s) => s.name).join(' → ')}`);
-      const baselineFailure = (await runAll(baselineSteps())).find((c) => !c.passed);
+      // Workflow rule: tests that already fail on the base branch are recorded, not blocking, as long
+      // as the failing tests can be identified (otherwise fail closed as before). An approved
+      // baseline fix still repairs them instead.
+      let baselineFailure: CodingReport['checks'][number] | undefined;
+      for (const step of baselineSteps()) {
+        const r = await run(step);
+        if (r.code === 0) continue;
+        if (step === testStep && !w.baselineFix) {
+          const ids = failingTests(r.output);
+          if (ids?.length) {
+            preExisting = new Set(ids);
+            report.preExistingFailures = { step: step.name, tests: ids };
+            this.log(`[${w.repo}] baseline: ${ids.length} test(s) already fail before any change; recorded as pre-existing (not blocking)`);
+            continue;
+          }
+        }
+        baselineFailure = { name: step.name, passed: false, durationMs: r.durationMs, log: trimLog(r.output) };
+        break;
+      }
       if (baselineFailure) {
         const log = baselineFailure.log ?? '';
         if (setupSteps.some((s) => s.name === baselineFailure.name)) throw new Stop('failed', `Setup step "${baselineFailure.name}" failed before any change:\n${log}`);
         if (baselineFailure.name === testStep.name) {
           if (!w.baselineFix) {
-            throw new Stop('escalated', `Existing tests already fail before any change, so a failing new test proves nothing:\n${log}`);
+            throw new Stop('escalated', `Existing tests already fail before any change, and the failing tests could not be identified from the output, so a failing new test would prove nothing:\n${log}`);
           }
           await repairBaseline(log);
         } else {
@@ -379,7 +431,7 @@ export class CodingAgent {
         );
         }
       }
-      report.testsFirst.baselinePassed = true;
+      report.testsFirst.baselinePassed = !preExisting;
 
       // ── Point 4: tests first ─────────────────────────────────────────────
       this.log(`[${w.repo}] phase 4: writing tests first`);
@@ -409,9 +461,12 @@ export class CodingAgent {
         if (problems.length === 0) {
           if (delta.some((d) => isAuxiliaryFile(d.path))) for (const s of setupSteps) await run(s);
           const red = await run(testStep);
-          if (red.code === 0) problems.push(`The new tests PASS on the current code, so they do not capture the change. Make them assert the new behaviour from the acceptance criteria.`);
+          // With pre-existing failures the suite is red anyway: only NEW failing tests count as red.
+          const fresh = preExisting && red.code !== 0 ? newFailures(red.output, preExisting) : undefined;
+          if (red.code === 0 || (preExisting && fresh?.length === 0)) problems.push(`The new tests PASS on the current code, so they do not capture the change. Make them assert the new behaviour from the acceptance criteria.`);
+          else if (preExisting && !fresh) problems.push(`The test run failed, but the failing tests could not be identified from its output, so it is not clear the new tests are the ones failing. Make sure the suite runs and reports each test.`);
           else {
-            report.testsFirst = { baselinePassed: true, files: testFiles.map((f) => f.path), failedBeforeChange: true };
+            report.testsFirst = { baselinePassed: !preExisting, files: testFiles.map((f) => f.path), failedBeforeChange: true };
             lockedTests = new Map(testFiles.map((f) => [f.path, f.content]));
             report.acceptanceCriteria.forEach((ac) => (ac.evidence = coverage[ac.id]));
             this.log(`[${w.repo}] tests are red as expected (${testFiles.length} file(s))`);
@@ -438,7 +493,7 @@ export class CodingAgent {
         }
 
         // Point 6: the pipeline runs the repo's own checks.
-        report.checks = await runAll(input.verify);
+        report.checks = await runChecks(input.verify);
         const failedCheck = report.checks.find((c) => !c.passed);
 
         // Point 7: deterministic scope self-check.

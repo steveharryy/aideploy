@@ -20,7 +20,7 @@ export function formatCodingReport(r: CodingReport): string {
   const lines = [
     `Coding agent ${r.ticket} ${r.workItem} [${r.repo}]: ${r.status.toUpperCase()} — ${r.summary}`,
     ...r.acceptanceCriteria.map((a) => `  ${a.id} ${a.status}${a.evidence.length ? `: ${a.evidence.slice(0, 3).join('; ')}` : ''}`),
-    `  tests-first: baseline ${r.testsFirst.baselinePassed ? 'green' : 'not green'}, new tests ${r.testsFirst.failedBeforeChange ? 'failed before the change ✓' : 'not proven red'}`,
+    `  tests-first: baseline ${r.testsFirst.baselinePassed ? 'green' : r.preExistingFailures ? `${r.preExistingFailures.tests.length} pre-existing failure(s), not blocking` : 'not green'}, new tests ${r.testsFirst.failedBeforeChange ? 'failed before the change ✓' : 'not proven red'}`,
     `  checks: ${r.checks.map((c) => `${c.name} ${c.passed ? '✓' : '✗'}`).join(', ') || '-'}`,
     `  review: ${r.review.verdict} after ${r.review.rounds} round(s)${r.review.findings.length ? `, ${r.review.findings.length} finding(s)` : ''}`,
     `  iterations: ${r.iterationsUsed}/${r.maxIterations}, Claude calls: ${r.claudeCalls}, ${Math.round(r.durationMs / 1000)}s`

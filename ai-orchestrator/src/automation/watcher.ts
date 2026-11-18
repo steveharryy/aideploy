@@ -279,6 +279,9 @@ export class AutomationWatcher {
       this.deps.log(`${task.id}: could not read the status history, not started: ${safeErrorMessage(err)}`);
       return undefined;
     }
+    // A ticket the pipeline already worked on needs a dated move into the status to run again. Without
+    // one (created directly in the status, or no history support) it would be re-run on every poll.
+    if (session && !entry?.at) return undefined;
     if (entry?.at && session?.updatedAt && Date.parse(entry.at) <= Date.parse(session.updatedAt)) return undefined; // already handled
     if (entry?.by) this.statusActor.set(task.id, entry.by);
     return kind;
@@ -861,6 +864,12 @@ export function qualitySummary(r: CodingReport, markdown: boolean): string[] {
   if (r.baselineFix) {
     lines.push(
       `${bold('Step 0, test baseline fix (approved in the plan):')} ${r.baselineFix.reason}. Changed: ${r.baselineFix.files.map(code).join(', ') || 'nothing'}${r.baselineFix.reverted.length ? `; reverted (not allowed): ${r.baselineFix.reverted.map(code).join(', ')}` : ''}`
+    );
+  }
+  if (r.preExistingFailures) {
+    const t = r.preExistingFailures.tests;
+    lines.push(
+      `${bold('Already failing before this change (not blocking, not caused by it):')} ${t.length} test(s) on the base branch: ${t.slice(0, 5).map(code).join(', ')}${t.length > 5 ? ` (+${t.length - 5} more)` : ''}. Worth a separate ticket.`
     );
   }
   if (r.scope.revertedFiles.length) lines.push(`${bold('Reverted by the pipeline:')} ${r.scope.revertedFiles.join('; ')}`);

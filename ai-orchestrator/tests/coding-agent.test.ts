@@ -554,3 +554,53 @@ describe('planned paths with placeholders', () => {
     expect(plannedPathMatcher('src/a.(b).ts')('src/a.(b).ts')).toBe(true); // regex characters are literal
   });
 });
+
+describe('pre-existing test failures (workflow rule: not blocking)', () => {
+  // vitest-style output: tests/existing.test.ts > old flaky date test always fails on the base branch.
+  const OLD = ' FAIL  tests/existing.test.ts > old date test';
+  const vitestOut = (failing: string[]) =>
+    [...failing, 'AssertionError: boom', '', ` Test Files  ${failing.length ? 1 : 0} failed | 1 passed (2)`].join('\n');
+  const execWithOldFailure = (extra: (cwd: string) => string[] = () => []): CommandRunner => async (cwd, cmd, ...rest) => {
+    if (cmd !== 'npm test') return fakeExec(cwd, cmd, ...rest);
+    const base = await fakeExec(cwd, cmd, ...rest);
+    const failing = [OLD, ...(base.code ? [' FAIL  tests/add.test.ts > test_AC1_adds_two_numbers'] : []), ...extra(cwd)];
+    return { code: 1, output: vitestOut(failing), durationMs: 1, timedOut: false };
+  };
+
+  it('baseline red only on identifiable old tests → recorded, coding continues to ready_for_pr', async () => {
+    const repo = makeRepo();
+    const { runner } = fakeClaude({});
+    const { report, changes } = await new CodingAgent({ runner, exec: execWithOldFailure(), bin: 'claude' }).run({ workItem: workItem(), repoPath: repo, verify: VERIFY });
+    expect(report.status).toBe('ready_for_pr');
+    expect(report.preExistingFailures).toEqual({ step: 'test', tests: ['tests/existing.test.ts > old date test'] });
+    expect(report.testsFirst).toMatchObject({ baselinePassed: false, failedBeforeChange: true });
+    expect(report.checks.find((c) => c.name === 'test')).toMatchObject({ passed: true, tolerated: ['tests/existing.test.ts > old date test'] });
+    expect(changes.map((c) => c.path).sort()).toEqual(['src/add.ts', 'tests/add.test.ts']);
+  });
+
+  it('a NEW failure caused by the change still blocks, and the coder is told which test is new', async () => {
+    const repo = makeRepo();
+    // The implementation also breaks another test until the fix round removes BREAK.
+    const breaks = (cwd: string) => (fs.readFileSync(path.join(cwd, 'src', 'add.ts'), 'utf-8').includes('BREAK') ? [' FAIL  tests/other.test.ts > other still works'] : []);
+    const { runner, calls } = fakeClaude({
+      implement: (cwd) => (fs.writeFileSync(path.join(cwd, 'src', 'add.ts'), FIXED + '// BREAK\n'), done()),
+      fix: (cwd) => (fs.writeFileSync(path.join(cwd, 'src', 'add.ts'), FIXED), done())
+    });
+    const { report } = await new CodingAgent({ runner, exec: execWithOldFailure(breaks), bin: 'claude' }).run({ workItem: workItem(), repoPath: repo, verify: VERIFY });
+    expect(report.status).toBe('ready_for_pr');
+    expect(report.fixRounds.map((f) => f.phase)).toEqual(['checks-and-scope']);
+    const fixPrompt = calls.find((c) => c.phase === 'fix')!.prompt;
+    expect(fixPrompt).toContain('New failures caused by the change');
+    expect(fixPrompt).toContain('tests/other.test.ts > other still works');
+  });
+
+  it('new tests that only "fail" because old tests fail are not accepted as red', async () => {
+    const repo = makeRepo();
+    const { runner } = fakeClaude({
+      tests: (cwd) => (fs.writeFileSync(path.join(cwd, 'tests', 'add.test.ts'), GOOD_TESTS + '// TRIVIAL\n'), done())
+    });
+    const { report } = await new CodingAgent({ runner, exec: execWithOldFailure(), bin: 'claude', maxIterations: 1 }).run({ workItem: workItem(), repoPath: repo, verify: VERIFY });
+    expect(report.status).toBe('failed');
+    expect(report.openIssues.join(' ')).toMatch(/new tests PASS on the current code/);
+  });
+});

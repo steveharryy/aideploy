@@ -11,6 +11,7 @@ import {
   type WatcherJira
 } from '../src/automation/watcher.js';
 import type { OrchestratorResult, TaskInput } from '../src/models/types.js';
+import { JiraClient } from '../src/integrations/jira/jira-client.js';
 
 // Status-driven triggers: a ticket MOVED into "AI Planning" / "AI Dev" starts the pipeline, with no
 // labels. Everything is faked: no Jira, git or Claude calls.
@@ -243,5 +244,33 @@ describe('status-driven triggers', () => {
     expect(jira.transitions).toEqual(['T2-1->Needs Input']);
     const text = jira.comments.map((c) => c.lines.join('\n')).join('\n');
     expect(text).toContain('move the ticket back to "AI Planning"');
+  });
+
+  it('a ticket created directly in AI Planning (no status history) is planned once, not on every poll', async () => {
+    const { watcher, jira, calls } = setup([ticket('T2-1', 'AI Planning')]);
+    jira.entry = undefined;
+    jira.transition = async () => false; // the bot cannot move it on
+    await watcher.runOnce();
+    await watcher.runOnce();
+    await watcher.runOnce();
+    expect(calls.plan).toBe(1);
+  });
+});
+
+describe('Jira changelog: the newest entries are read on a long history', () => {
+  it('fetches the last page when the history has more than 100 entries', async () => {
+    const urls: string[] = [];
+    const entry = (n: number, status: string) => ({ author: { displayName: `P${n}` }, created: `2026-11-18T10:${String(n % 60).padStart(2, '0')}:00.000+0000`, items: [{ field: 'status', toString: status }] });
+    const fetchImpl = (async (url: string) => {
+      urls.push(url);
+      const body = url.includes('startAt=50')
+        ? { values: [...Array.from({ length: 99 }, (_, i) => entry(i, 'Plan Review')), entry(150, 'AI Planning')], total: 150 }
+        : { values: Array.from({ length: 100 }, (_, i) => entry(i, i === 0 ? 'AI Planning' : 'Plan Review')), total: 150 };
+      return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
+    }) as unknown as typeof fetch;
+    const client = new JiraClient({ baseUrl: 'https://x.atlassian.net', email: 'a', apiToken: 'b', fetchImpl });
+    const got = await client.getStatusEntry('T2-1', 'AI Planning');
+    expect(urls.some((u) => u.includes('startAt=50'))).toBe(true);
+    expect(got?.by).toBe('P150');
   });
 });
