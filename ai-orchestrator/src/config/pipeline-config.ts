@@ -44,6 +44,11 @@ export interface PipelineConfig {
     moveStatus: boolean;
     /** Project key → phase → existing Jira status name. */
     phaseStatus: Record<string, Partial<Record<SessionPhase, string>>>;
+    /**
+     * Status-driven triggers (optional). A ticket entering `plan` starts planning; entering `implement`
+     * approves the plan and starts coding. Absent = labels only. The statuses must exist in Jira.
+     */
+    triggerStatus?: { plan: string; implement: string };
   };
   concurrency: { maxActiveSessions: number };
   timers: { escalateAfterH: number; remindAfterH: number; giveUpAfterH: number };
@@ -166,6 +171,14 @@ export function parsePipelineConfig(raw: unknown): PipelineConfig {
       productField: fieldId(j.product_field, 'jira.product_field'),
       storyPointsField: fieldId(j.story_points_field, 'jira.story_points_field'),
       moveStatus: bool(j.move_status, d.jira.moveStatus, 'jira.move_status'),
+      triggerStatus: (() => {
+        const t = obj(j.trigger_status);
+        if (Object.keys(t).length === 0) return undefined;
+        return {
+          plan: str(t.plan, '', 'jira.trigger_status.plan'),
+          implement: str(t.implement, '', 'jira.trigger_status.implement')
+        };
+      })(),
       phaseStatus: (() => {
         const out: Record<string, Partial<Record<SessionPhase, string>>> = {};
         for (const [project, map] of Object.entries(obj(j.phase_status))) {

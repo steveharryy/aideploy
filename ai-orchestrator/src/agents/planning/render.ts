@@ -84,7 +84,11 @@ export function renderPlan(plan: TicketPlan): string {
 }
 
 /** Batched blocking questions, with answer instructions. */
-export function renderQuestions(plan: TicketPlan, readyLabel: string, round: number, maxRounds: number): string[] {
+/** How a person asks for another planning round: a label (default) or moving the ticket to a status. */
+export const againHow = (name: string, statusMode?: boolean): string =>
+  statusMode ? `move the ticket back to "${name}"` : `add the label "${name}" again`;
+
+export function renderQuestions(plan: TicketPlan, readyLabel: string, round: number, maxRounds: number, statusMode?: boolean): string[] {
   const letters = 'ABCDEFGH';
   const lines: string[] = [
     `${plan.ticket} needs ${plan.questions.length} answer${plan.questions.length === 1 ? '' : 's'} before it can be planned (round ${round} of ${maxRounds}).`
@@ -95,16 +99,16 @@ export function renderQuestions(plan: TicketPlan, readyLabel: string, round: num
     q.options.forEach((o, i) => lines.push(`   ${letters[i] ?? '-'}) ${o}${q.defaultOption && o === q.defaultOption ? '  (default)' : ''}`));
   }
   const example = plan.questions.map((q) => `${q.id}: A`).join(', ');
-  lines.push(`How to answer: reply in a comment (e.g. "${example}", or your own words), then add the label "${readyLabel}" again.`);
+  lines.push(`How to answer: reply in a comment (e.g. "${example}", or your own words), then ${againHow(readyLabel, statusMode)}.`);
   if (plan.assumptions.length) lines.push('Already assumed (correct if wrong):', ...plan.assumptions.map((a) => `- ${a}`));
   return lines;
 }
 
 /** Too-vague ticket: what the reporter must add. */
-export function renderMissing(plan: TicketPlan, readyLabel: string): string[] {
+export function renderMissing(plan: TicketPlan, readyLabel: string, statusMode?: boolean): string[] {
   return [
     `Not enough information to plan ${plan.ticket}. Please add:`,
     ...plan.missingForReporter.map((m) => `- ${m}`),
-    `Then add the label "${readyLabel}" again. Nothing has been changed.`
+    `Then ${againHow(readyLabel, statusMode)}. Nothing has been changed.`
   ];
 }

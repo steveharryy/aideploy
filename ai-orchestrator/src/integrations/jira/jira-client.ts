@@ -243,6 +243,30 @@ export class JiraClient {
     return true;
   }
 
+  /**
+   * When, and by whom, the ticket most recently moved INTO the given status (from the changelog).
+   * Used for status-driven triggers: who approved the plan, and whether this entry was already handled.
+   */
+  async getStatusEntry(issueKey: string, statusName: string): Promise<{ by?: string; at?: string } | undefined> {
+    const data = await this.request<{
+      values?: Array<{ author?: { displayName?: string }; created?: string; items?: Array<{ field?: string; toString?: string | null }> }>;
+    }>(`/rest/api/3/issue/${encodeURIComponent(issueKey)}/changelog?maxResults=100`);
+    const wanted = statusName.trim().toLowerCase();
+    const entries = (data.values || []).filter((v) =>
+      (v.items || []).some((i) => i.field === 'status' && (i.toString || '').trim().toLowerCase() === wanted)
+    );
+    const last = entries[entries.length - 1];
+    return last ? { by: last.author?.displayName, at: last.created } : undefined;
+  }
+
+  /** Names of every status the project's workflows define (to check a configured status exists). */
+  async projectStatusNames(projectKey: string): Promise<string[]> {
+    const data = await this.request<Array<{ statuses?: Array<{ name: string }> }>>(
+      `/rest/api/3/project/${encodeURIComponent(projectKey)}/statuses`
+    );
+    return [...new Set((data || []).flatMap((t) => (t.statuses || []).map((st) => st.name)))];
+  }
+
   /** Who most recently added a label (from the changelog), e.g. the approver of "ai-approved". */
   async getLabelAdder(issueKey: string, label: string): Promise<string | undefined> {
     const data = await this.request<{

@@ -12,11 +12,12 @@ export type SessionPhase =
   | 'plan_review' // plan posted, waiting for approval
   | 'approved' // plan approved, coding about to start
   | 'coding' // coding agents running
+  | 'qa' // coding finished, independent re-test running
   | 'pr_open' // verified, pull request(s) opened
   | 'done' // verified, no PR (repo not a git clone)
   | 'needs_human'; // stopped: duplicate, error, invalid plan, retry limit…
 
-export const SESSION_PHASES: SessionPhase[] = ['planning', 'needs_input', 'needs_info', 'plan_review', 'approved', 'coding', 'pr_open', 'done', 'needs_human'];
+export const SESSION_PHASES: SessionPhase[] = ['planning', 'needs_input', 'needs_info', 'plan_review', 'approved', 'coding', 'qa', 'pr_open', 'done', 'needs_human'];
 
 export interface PhaseChange {
   phase: SessionPhase;

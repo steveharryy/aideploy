@@ -36,6 +36,8 @@ export interface OrchestratorOptions {
    * (design doc: "tech lead approves the plan"). Resolve false to stop with PLAN_REJECTED.
    */
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  /** Optional progress hook: called when the independent re-test starts (shown as the QA phase). Never fatal. */
+  onStage?: (stage: 'testing') => void | Promise<void>;
 }
 
 /** Read-only preview of what a run would do. */
@@ -56,6 +58,7 @@ export class Orchestrator {
   private resolveRepoPath?: (repoId: string) => string;
   private resolveBaseBranch?: (repoId: string) => string | undefined;
   private approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  private onStage?: (stage: 'testing') => void | Promise<void>;
 
   constructor(options: OrchestratorOptions) {
     this.aiProvider = options.aiProvider;
@@ -72,6 +75,7 @@ export class Orchestrator {
     this.resolveRepoPath = options.resolveRepoPath;
     this.resolveBaseBranch = options.resolveBaseBranch;
     this.approvePlan = options.approvePlan;
+    this.onStage = options.onStage;
     if (this.workspace && !this.resolveRepoPath) {
       throw new Error('Orchestrator: resolveRepoPath is required when a workspace manager is configured.');
     }
@@ -311,6 +315,7 @@ export class Orchestrator {
     // Step 4: Testing Agent Verification
     this.log('TESTING', 'Running tests on modified repositories...');
     begin('verify');
+    await Promise.resolve(this.onStage?.('testing')).catch(() => {});
     let testingResult: TestingResult;
     try {
       testingResult = await this.testingAgent.runTests(impact.affectedRepositories, workdirs);

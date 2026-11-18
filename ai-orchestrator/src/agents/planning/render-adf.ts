@@ -74,6 +74,8 @@ export interface PlanCommentMeta {
   version?: number;
   readyLabel: string;
   approvedLabel: string;
+  /** readyLabel / approvedLabel are Jira status names: the ticket is moved, not labelled. */
+  statusMode?: boolean;
   promptVersion?: string;
   costUsd?: number;
   /** Per-repo facts: branch, verify commands, rollback. */
@@ -233,8 +235,8 @@ export function planCommentAdf(plan: TicketPlan, meta: PlanCommentMeta): AdfNode
       'success',
       para(strong('Next step')),
       bullets([
-        [strong('Approve: '), text('add the label '), code(meta.approvedLabel)],
-        [strong('Request changes: '), text('comment what to change, then add the label '), code(meta.readyLabel), text(' again (you get a revised plan)')],
+        [strong('Approve: '), text(meta.statusMode ? 'move the ticket to ' : 'add the label '), code(meta.approvedLabel)],
+        [strong('Request changes: '), text(meta.statusMode ? 'comment what to change, then move the ticket back to ' : 'comment what to change, then add the label '), code(meta.readyLabel), text(meta.statusMode ? ' (you get a revised plan)' : ' again (you get a revised plan)')],
         [strong('Reject: '), text('do nothing; optionally comment why')]
       ])
     )
@@ -244,7 +246,7 @@ export function planCommentAdf(plan: TicketPlan, meta: PlanCommentMeta): AdfNode
 
 // ── blocking questions ─────────────────────────────────────────────────────────────────────
 
-export function questionsCommentAdf(plan: TicketPlan, readyLabel: string, round: number, maxRounds: number): AdfNode {
+export function questionsCommentAdf(plan: TicketPlan, readyLabel: string, round: number, maxRounds: number, statusMode?: boolean): AdfNode {
   const letters = 'ABCDEFGH';
   const C: AdfNode[] = [
     panel(
@@ -267,7 +269,7 @@ export function questionsCommentAdf(plan: TicketPlan, readyLabel: string, round:
   C.push(
     panel(
       'info',
-      para(strong('How to answer: '), text('reply in a comment, e.g. '), code(plan.questions.map((q) => `${q.id}: A`).join(', ')), text(' or in your own words, then add the label '), code(readyLabel), text(' again.'))
+      para(strong('How to answer: '), text('reply in a comment, e.g. '), code(plan.questions.map((q) => `${q.id}: A`).join(', ')), text(statusMode ? ' or in your own words, then move the ticket back to ' : ' or in your own words, then add the label '), code(readyLabel), text(statusMode ? '.' : ' again.'))
     )
   );
   return doc(C);
@@ -275,11 +277,11 @@ export function questionsCommentAdf(plan: TicketPlan, readyLabel: string, round:
 
 // ── too vague: back to the reporter ────────────────────────────────────────────────────────
 
-export function missingInfoCommentAdf(plan: TicketPlan, readyLabel: string): AdfNode {
+export function missingInfoCommentAdf(plan: TicketPlan, readyLabel: string, statusMode?: boolean): AdfNode {
   return doc([
     panel('error', para(strong(`🤖 AI Orchestrator · Not enough information to plan ${plan.ticket}`), text(' · '), status('needs more info', 'red'))),
     para(text('Please add the following to the ticket (description or a comment):')),
     bullets(plan.missingForReporter.map((m) => withCode(m))),
-    panel('info', para(text('Then add the label '), code(readyLabel), text(' again. Nothing has been changed.')))
+    panel('info', para(text(statusMode ? 'Then move the ticket back to ' : 'Then add the label '), code(readyLabel), text(statusMode ? '. Nothing has been changed.' : ' again. Nothing has been changed.')))
   ]);
 }

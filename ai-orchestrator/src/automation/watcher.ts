@@ -3,7 +3,7 @@ import path from 'node:path';
 import type { OrchestratorResult, TaskInput } from '../models/types.js';
 import type { ImplementationPlan } from '../providers/claude-code-provider.js';
 import type { PlanQuestion, TicketPlan } from '../agents/planning/types.js';
-import { renderMissing, renderQuestions } from '../agents/planning/render.js';
+import { againHow, renderMissing, renderQuestions } from '../agents/planning/render.js';
 import { missingInfoCommentAdf, planCommentAdf, questionsCommentAdf, type AdfNode } from '../agents/planning/render-adf.js';
 import { FileSessionStore, type SessionPhase, type SessionStore } from '../jobs/session-store.js';
 import { redactSecrets, safeErrorMessage } from '../util/redact.js';
@@ -41,6 +41,11 @@ export interface WatcherConfig {
    * config). Undefined = leave the status alone. A missing transition is logged, never fatal.
    */
   statusForPhase?: (ticket: string, phase: SessionPhase) => string | undefined;
+  /**
+   * Status-driven triggers (in addition to the labels, which keep working). A ticket entering `plan`
+   * starts planning; entering `implement` approves the plan and starts coding. Absent = labels only.
+   */
+  statusTriggers?: { plan: string; implement: string };
   /** Report what would happen; no Jira writes, no AI runs. */
   dryRun: boolean;
   /** Rounds of blocking questions before the ticket is sent back as too vague (default 2). */
@@ -109,6 +114,8 @@ export interface WatcherJira {
   updateLabels(key: string, add?: string[], remove?: string[]): Promise<void>;
   transition(key: string, statusName: string): Promise<boolean>;
   getLabelAdder(key: string, label: string): Promise<string | undefined>;
+  /** When and by whom the ticket last moved INTO a status (status-driven triggers). Optional. */
+  getStatusEntry?(key: string, statusName: string): Promise<{ by?: string; at?: string } | undefined>;
   assign?(key: string, accountId: string): Promise<void>;
 }
 
@@ -117,7 +124,7 @@ export interface WatcherDeps {
   /** Dedup + impact + read-only change plan. */
   plan(task: TaskInput): Promise<PlanOutcome>;
   /** Full pipeline with the plan already approved. */
-  implement(task: TaskInput): Promise<OrchestratorResult>;
+  implement(task: TaskInput, onStage?: (stage: 'testing') => void | Promise<void>): Promise<OrchestratorResult>;
   /** Push + open PRs for committed ticket branches (may return [] when no repo is a git clone). */
   publish(task: TaskInput, result: OrchestratorResult, plan: SavedPlan): Promise<{ links: PullRequestLink[]; skipped: string[] }>;
   /** Implementation attempts already made for this ticket (from the job record). */
@@ -219,6 +226,64 @@ export class AutomationWatcher {
     return Array.isArray(labels) && labels.includes(label);
   }
 
+  /** In-flight tickets (this process), and what the poll last saw as each ticket's Jira status. */
+  private inFlight = new Set<string>();
+  private currentStatus = new Map<string, string>();
+  private statusActor = new Map<string, string>();
+
+  private get statusMode(): boolean {
+    return !!this.config.statusTriggers;
+  }
+  /** What a person types/clicks to start planning (label name, or the status to move the ticket to). */
+  private readyName(): string {
+    return this.config.statusTriggers?.plan ?? this.config.labels.ready;
+  }
+  private approvedName(): string {
+    return this.config.statusTriggers?.implement ?? this.config.labels.approved;
+  }
+  /** "add the label "X"" (labels) or "move the ticket to "X"" (status mode). */
+  private ask(kind: 'ready' | 'approved'): string {
+    const name = kind === 'ready' ? this.readyName() : this.approvedName();
+    return this.statusMode ? `move the ticket to "${name}"` : `add the label "${name}"`;
+  }
+  /** "add the label "X" again" / "move the ticket back to "X"". */
+  private again(kind: 'ready' | 'approved'): string {
+    return againHow(kind === 'ready' ? this.readyName() : this.approvedName(), this.statusMode);
+  }
+  /** Who approved: whoever moved the ticket into the implement status, else whoever added the label. */
+  private async approver(task: TaskInput): Promise<string> {
+    const byStatus = this.statusActor.get(task.id);
+    if (byStatus) return byStatus;
+    return (await this.deps.jira.getLabelAdder(task.id, this.config.labels.approved).catch(() => undefined)) || 'unknown';
+  }
+
+  /**
+   * Status-driven trigger: is this ticket in the plan / implement status AND has it entered that
+   * status since the pipeline last wrote to it? The second check stops a ticket that could not be
+   * moved on (no transition, Jira outage) from being run again every cycle.
+   */
+  private async statusTrigger(task: TaskInput): Promise<'ready' | 'approved' | undefined> {
+    const st = this.config.statusTriggers;
+    const status = typeof task.metadata?.status === 'string' ? (task.metadata.status as string) : undefined;
+    if (!st || !status) return undefined;
+    const now = status.trim().toLowerCase();
+    const kind = now === st.implement.trim().toLowerCase() ? 'approved' : now === st.plan.trim().toLowerCase() ? 'ready' : undefined;
+    if (!kind) return undefined;
+    const session = this.sessions.get(task.id);
+    if (session && ['planning', 'coding', 'qa'].includes(session.phase)) return undefined; // still running
+    let entry: { by?: string; at?: string } | undefined;
+    try {
+      entry = await this.deps.jira.getStatusEntry?.(task.id, status);
+    } catch (err) {
+      // Fail closed: without the change history we cannot tell a new entry from one already handled.
+      this.deps.log(`${task.id}: could not read the status history, not started: ${safeErrorMessage(err)}`);
+      return undefined;
+    }
+    if (entry?.at && session?.updatedAt && Date.parse(entry.at) <= Date.parse(session.updatedAt)) return undefined; // already handled
+    if (entry?.by) this.statusActor.set(task.id, entry.by);
+    return kind;
+  }
+
   // Jira writes are no-ops in dry-run mode.
   private async comment(key: string, lines: string[], pre?: string) {
     if (!this.config.dryRun) await this.deps.jira.addComment(key, [BOT, ...lines].map(redactSecrets), pre === undefined ? undefined : redactSecrets(pre));
@@ -288,9 +353,11 @@ export class AutomationWatcher {
 
   private async move(key: string, status?: string) {
     if (!status || this.config.dryRun) return;
+    if (this.currentStatus.get(key)?.trim().toLowerCase() === status.trim().toLowerCase()) return; // already there
     try {
       const moved = await this.deps.jira.transition(key, status);
-      if (!moved) this.deps.log(`${key}: workflow has no transition to "${status}" from its current status; left as is.`);
+      if (moved) this.currentStatus.set(key, status);
+      else this.deps.log(`${key}: workflow has no transition to "${status}" from its current status; left as is.`);
     } catch (err) {
       this.deps.log(`${key}: status change to "${status}" failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -321,19 +388,35 @@ export class AutomationWatcher {
     return this.processTask(task);
   }
 
-  /** Routes a ticket by its labels; any error is reported on the ticket and handed to a human. */
+  /**
+   * Routes a ticket by its labels, or (status mode) by the status it was moved into; any error is
+   * reported on the ticket and handed to a human.
+   */
   private async processTask(task: TaskInput): Promise<{ action: TicketAction; detail?: string }> {
     const L = this.config.labels;
     if (this.deps.killSwitch?.()) {
       this.deps.log(`${task.id}: kill switch is on, not started`);
       return { action: 'skipped', detail: 'kill switch on' };
     }
+    if (typeof task.metadata?.status === 'string') this.currentStatus.set(task.id, task.metadata.status as string);
     const triggers = [L.approved, L.ready].filter((l) => this.hasLabel(task, l));
-    if (triggers.length === 0) return { action: 'skipped' };
+    const statusTrigger = triggers.length === 0 ? await this.statusTrigger(task) : undefined;
+    if (triggers.length === 0 && !statusTrigger) return { action: 'skipped' };
+    if (this.inFlight.has(task.id)) return { action: 'skipped', detail: 'already running' };
+    this.inFlight.add(task.id);
+    try {
+      return await this.runTriggered(task, triggers, statusTrigger);
+    } finally {
+      this.inFlight.delete(task.id);
+    }
+  }
 
+  private async runTriggered(task: TaskInput, triggers: string[], statusTrigger?: 'ready' | 'approved'): Promise<{ action: TicketAction; detail?: string }> {
+    const L = this.config.labels;
     // Claim first: remove the trigger label BEFORE any paid work. If Jira refuses (no Edit
     // permission, outage), nothing runs, so a ticket can never be re-planned every cycle.
-    if (!this.config.dryRun) {
+    // (A status trigger is claimed by the session phase written when the run starts.)
+    if (triggers.length > 0 && !this.config.dryRun) {
       try {
         await this.deps.jira.updateLabels(task.id, [], triggers);
       } catch (err) {
@@ -344,7 +427,8 @@ export class AutomationWatcher {
       }
     }
     try {
-      const action = triggers.includes(L.approved) ? await this.handleApproved(task) : await this.handleReady(task);
+      const approved = triggers.includes(L.approved) || statusTrigger === 'approved';
+      const action = approved ? await this.handleApproved(task) : await this.handleReady(task);
       return { action };
     } catch (err) {
       const message = safeErrorMessage(err);
@@ -362,23 +446,24 @@ export class AutomationWatcher {
    */
   async sweepStale(now = Date.now()): Promise<string[]> {
     if (this.config.dryRun) return [];
-    const L = this.config.labels;
     const limits: Partial<Record<SessionPhase, number>> = {
       planning: this.config.stalePlanningMs ?? 45 * 60 * 1000,
-      coding: this.config.staleCodingMs ?? 3 * 60 * 60 * 1000
+      coding: this.config.staleCodingMs ?? 3 * 60 * 60 * 1000,
+      qa: this.config.staleCodingMs ?? 3 * 60 * 60 * 1000
     };
     const swept: string[] = [];
     for (const s of this.sessions.list()) {
       const limit = limits[s.phase];
       if (!limit || now - Date.parse(s.updatedAt) < limit) continue;
       if (s.phase === 'planning' && s.detail?.startsWith('waiting to retry')) continue;
-      const what = s.phase === 'coding' ? 'implementing' : 'planning';
-      const retryLabel = s.phase === 'coding' ? L.approved : L.ready;
+      const working = s.phase === 'coding' || s.phase === 'qa';
+      const what = working ? 'implementing' : 'planning';
+      const retryHow = this.ask(working ? 'approved' : 'ready');
       this.deps.log(`${s.ticket}: stuck in ${s.phase} since ${s.updatedAt} → needs_human`);
       try {
         await this.comment(s.ticket, [
           `The pipeline stopped while ${what} this ticket (no progress since ${s.updatedAt.slice(0, 16).replace('T', ' ')} UTC), probably a restart or crash.`,
-          `Nothing was posted or merged. To try again, add the label "${retryLabel}".`
+          `Nothing was posted or merged. To try again, ${retryHow}.`
         ]);
       } catch (err) {
         this.deps.log(`${s.ticket}: could not post the stuck-ticket comment: ${safeErrorMessage(err)}`);
@@ -417,7 +502,7 @@ export class AutomationWatcher {
       await this.sendBack(task, [
         `The plan for ${task.id} was revised ${maxRevisions} times without being approved.`,
         'Please clarify the ticket (expected behaviour, scope, examples) so a plan can be agreed, or plan it by hand.',
-        `Then add the label "${L.ready}" again.`
+        `Then ${this.again('ready')}.`
       ], clear);
       return 'needs-info';
     }
@@ -431,7 +516,7 @@ export class AutomationWatcher {
       if (reopening && !this.config.dryRun) {
         this.deps.log(`${task.id}: approved plan v${prior!.version ?? 1} reopened → re-planning`);
         await this.comment(task.id, [
-          `Approval of change plan v${prior!.version ?? 1} (approved by ${prior!.approvedBy ?? 'unknown'} at ${prior!.approvedAt}) is withdrawn because "${L.ready}" was added again.`,
+          `Approval of change plan v${prior!.version ?? 1} (approved by ${prior!.approvedBy ?? 'unknown'} at ${prior!.approvedAt}) is withdrawn because ${this.statusMode ? `the ticket was moved back to "${this.readyName()}"` : `"${L.ready}" was added again`}.`,
           `Re-planning from the newest comments. The approved version is kept for comparison.`
         ]);
       }
@@ -464,7 +549,7 @@ export class AutomationWatcher {
       await this.comment(task.id, [
         'Not started: no repository matched this ticket.',
         ...(outcome.reason ? [`Reason: ${outcome.reason}`] : []),
-        `Add a component for the target repo, or add the repo to catalog/repos.yaml, then add the label "${L.ready}" again.`
+        `Add a component for the target repo, or add the repo to catalog/repos.yaml, then ${this.again('ready')}.`
       ]);
       await this.toPhase(task.id, 'needs_human', clear, 'no matching repository');
       return 'no-repo';
@@ -488,7 +573,7 @@ export class AutomationWatcher {
           ]
         };
         this.deps.log(`${task.id}: still blocked after ${questionState.rounds} question round(s) → back to reporter`);
-        await this.sendBack(task, renderMissing(plan, L.ready), clear, missingInfoCommentAdf(plan, L.ready));
+        await this.sendBack(task, renderMissing(plan, this.readyName(), this.statusMode), clear, missingInfoCommentAdf(plan, this.readyName(), this.statusMode));
         return 'needs-info';
       }
       const round = questionState.rounds + 1;
@@ -496,15 +581,15 @@ export class AutomationWatcher {
       this.deps.log(`${task.id}: ${outcome.ticketPlan.questions.length} blocking question(s) (round ${round}/${maxRounds})`);
       await this.richComment(
         task.id,
-        questionsCommentAdf(outcome.ticketPlan, L.ready, round, maxRounds),
-        renderQuestions(outcome.ticketPlan, L.ready, round, maxRounds)
+        questionsCommentAdf(outcome.ticketPlan, this.readyName(), round, maxRounds, this.statusMode),
+        renderQuestions(outcome.ticketPlan, this.readyName(), round, maxRounds, this.statusMode)
       );
       await this.toPhase(task.id, 'needs_input', clear, `round ${round}: ${outcome.ticketPlan.questions.length} question(s)`);
       return 'needs-input';
     }
     if (outcome.status === 'needs-info' && outcome.ticketPlan) {
       this.deps.log(`${task.id}: too vague → back to reporter`);
-      await this.sendBack(task, renderMissing(outcome.ticketPlan, L.ready), clear, missingInfoCommentAdf(outcome.ticketPlan, L.ready));
+      await this.sendBack(task, renderMissing(outcome.ticketPlan, this.readyName(), this.statusMode), clear, missingInfoCommentAdf(outcome.ticketPlan, this.readyName(), this.statusMode));
       return 'needs-info';
     }
 
@@ -539,8 +624,8 @@ export class AutomationWatcher {
         ...(outcome.ticketPlan?.warnings.length
           ? [`⚠ ${outcome.ticketPlan.warnings.length} warning(s) in this plan: read them before approving.`, ...outcome.ticketPlan.warnings.map((w) => `⚠ ${w}`)]
           : []),
-        `To approve: add the label "${L.approved}".`,
-        `To request changes: comment what to change, then add the label "${L.ready}" again (the plan is revised using your comments).`,
+        `To approve: ${this.ask('approved')}.`,
+        `To request changes: comment what to change, then ${this.again('ready')} (the plan is revised using your comments).`,
         'To reject: do nothing (optionally comment why); the ticket stays as it is.',
         'Nothing has been changed yet.'
     ];
@@ -549,8 +634,9 @@ export class AutomationWatcher {
         task.id,
         planCommentAdf(outcome.ticketPlan, {
           version: saved.version,
-          readyLabel: L.ready,
-          approvedLabel: L.approved,
+          readyLabel: this.readyName(),
+          approvedLabel: this.approvedName(),
+          statusMode: this.statusMode,
           promptVersion: outcome.promptVersion,
           costUsd: outcome.costUsd,
           repoFacts: outcome.repoFacts
@@ -575,7 +661,7 @@ export class AutomationWatcher {
       this.deps.log(`${task.id}: "${L.approved}" found but no plan on record → planning first`);
       if (this.config.dryRun) return 'planned';
       await this.deps.jira.updateLabels(task.id, [], [L.approved]);
-      await this.comment(task.id, [`"${L.approved}" was added before a change plan existed. Drafting the plan first; approve it once you have reviewed it.`]);
+      await this.comment(task.id, [`${this.statusMode ? `The ticket was moved to "${this.approvedName()}"` : `"${L.approved}" was added`} before a change plan existed. Drafting the plan first; approve it once you have reviewed it.`]);
       return this.handleReady(task);
     }
 
@@ -587,7 +673,7 @@ export class AutomationWatcher {
       if (this.config.dryRun) return 'skipped';
       await this.deps.jira.updateLabels(task.id, [], [L.approved]);
       if (!plan.approvedAt) {
-        plan.approvedBy = (await this.deps.jira.getLabelAdder(task.id, L.approved).catch(() => undefined)) || 'unknown';
+        plan.approvedBy = await this.approver(task);
         plan.approvedAt = new Date().toISOString();
         this.savePlan(plan);
       }
@@ -596,7 +682,7 @@ export class AutomationWatcher {
       await this.comment(task.id, [
         `Change plan${v} approved by ${plan.approvedBy} at ${plan.approvedAt}. The plan is now locked.`,
         `The coding phase is switched off for now, so no branch, code or PR was created.`,
-        `When coding is switched on, add the label "${L.approved}" again to start implementation from this plan.`
+        `When coding is switched on, ${this.again('approved')} to start implementation from this plan.`
       ]);
       return 'skipped';
     }
@@ -618,7 +704,7 @@ export class AutomationWatcher {
     if (this.config.dryRun) return 'implemented-no-pr';
 
     if (!plan.approvedAt) {
-      plan.approvedBy = (await this.deps.jira.getLabelAdder(task.id, L.approved).catch(() => undefined)) || 'unknown';
+      plan.approvedBy = await this.approver(task);
       plan.approvedAt = new Date().toISOString();
       this.savePlan(plan);
     }
@@ -643,7 +729,9 @@ export class AutomationWatcher {
           }
         : {})
     };
-    const result = await this.deps.implement(fresh);
+    const result = await this.deps.implement(fresh, async (stage) => {
+      if (stage === 'testing') await this.toPhase(task.id, 'qa', [], 'independent re-test of the applied changes');
+    });
 
     const changed = (result.teamResult?.repoResults ?? []).map((r) => `${r.repoId}: ${r.changedFiles.join(', ') || 'no file changes'}`);
     const verify = (result.testingResult?.repoResults ?? []).flatMap((r) =>
@@ -669,7 +757,7 @@ export class AutomationWatcher {
         .join('\n\n');
       await this.comment(
         task.id,
-        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), `A person needs to look at this. To retry with the same approved plan, add the label "${L.approved}" again.`],
+        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), `A person needs to look at this. To retry with the same approved plan, ${this.again('approved')}.`],
         failedCheck || undefined
       );
       await this.toPhase(task.id, 'needs_human', [], `implementation stopped: ${result.status}`);

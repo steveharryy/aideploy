@@ -105,6 +105,8 @@ function makeCodingAgentProvider(catalog: ServiceCatalog | undefined): CodingAge
 export interface CreateOrchestratorOptions {
   /** Human approval after impact analysis, before any code is written. */
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
+  /** Progress hook: the independent re-test is starting (the watcher shows it as the QA phase). */
+  onStage?: (stage: 'testing') => void | Promise<void>;
 }
 
 /** Loaded once: routing, repo paths, deploy order and verify contract (catalog/repos.yaml). */
@@ -173,7 +175,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
     workspace: makeWorkspace(),
     resolveRepoPath: (repoId) => repoPaths[repoId] || path.resolve(repoRoot, repoId),
     resolveBaseBranch: (repoId) => catalog?.get(repoId)?.baseBranch,
-    approvePlan: options.approvePlan
+    approvePlan: options.approvePlan,
+    onStage: options.onStage
   });
 }
 
@@ -857,7 +860,30 @@ function onStopSignal(handler: () => void): void {
 }
 
 /** The label-driven automation (shared by the poller and the webhook server). */
-function createWatcher(args: CliArgs, providerName: string) {
+/**
+ * Status-driven triggers from config/pipeline.yaml (jira.trigger_status), checked against the
+ * project's real statuses. A name Jira does not know would make every search fail, so a mismatch
+ * falls back to labels only, with a clear message, instead of breaking the watcher.
+ */
+async function resolveTriggerStatus(): Promise<{ plan: string; implement: string } | undefined> {
+  const ts = pipelineConfig().jira.triggerStatus;
+  if (!ts) return undefined;
+  const project = process.env.AUTOMATION_PROJECT || 'T2';
+  try {
+    const known = (await makeJira().projectStatusNames(project)).map((n) => n.toLowerCase());
+    const missing = [ts.plan, ts.implement].filter((n) => !known.includes(n.toLowerCase()));
+    if (missing.length) {
+      console.error(`Status triggers NOT enabled: project ${project} has no status named ${missing.map((m) => `"${m}"`).join(' / ')}. Labels only for now. Ask a Jira admin to add it (see the workflow request), then restart.`);
+      return undefined;
+    }
+  } catch (err) {
+    console.error(`Status triggers NOT enabled: could not read the statuses of project ${project} (${redactSecrets(err instanceof Error ? err.message : String(err))}). Labels only for now.`);
+    return undefined;
+  }
+  return ts;
+}
+
+function createWatcher(args: CliArgs, providerName: string, triggerStatus?: { plan: string; implement: string }) {
   const labels: WatcherLabels = {
     ready: process.env.LABEL_READY || DEFAULT_LABELS.ready,
     approved: process.env.LABEL_APPROVED || DEFAULT_LABELS.approved
@@ -870,7 +896,7 @@ function createWatcher(args: CliArgs, providerName: string) {
   const reporterClause = reporter.toLowerCase() === 'any' ? '' : ` AND reporter = ${reporter === 'currentUser()' ? reporter : `"${reporter}"`}`;
   const jql =
     process.env.AUTOMATION_JQL ||
-    `project = ${project}${reporterClause} AND labels in ("${labels.ready}", "${labels.approved}") AND statusCategory != Done ORDER BY updated ASC`;
+    `project = ${project}${reporterClause} AND (labels in ("${labels.ready}", "${labels.approved}")${triggerStatus ? ` OR status in ("${triggerStatus.plan}", "${triggerStatus.implement}")` : ''}) AND statusCategory != Done ORDER BY updated ASC`;
   const store = new JobStore({ jobsDir });
   const jira = makeJira();
   const log = (m: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(m)}`);
@@ -882,6 +908,7 @@ function createWatcher(args: CliArgs, providerName: string) {
       autoApprove: process.env.AUTO_APPROVE_PLAN === 'true',
       codingEnabled: () => pipelineConfig().coding.enabled,
       maxAttempts: Number(process.env.AUTOMATION_MAX_ATTEMPTS) || 3,
+      ...(triggerStatus ? { statusTriggers: triggerStatus } : {}),
       maxQuestionRounds: Number(process.env.AUTOMATION_MAX_QUESTION_ROUNDS) || pipelineConfig().planning.maxQuestionRounds,
       maxPlanRevisions: pipelineConfig().planning.maxPlanRevisions,
       assignToReporter: intakeFor(pipelineConfig(), `${project}-0`).assignToReporter,
@@ -945,7 +972,7 @@ function createWatcher(args: CliArgs, providerName: string) {
           return { status, reason, repos: [], plans: {}, text: '' };
         }
       },
-      implement: (task) => createOrchestrator(providerName, { approvePlan: async () => true }).run(task),
+      implement: (task, onStage) => createOrchestrator(providerName, { approvePlan: async () => true, onStage }).run(task),
       async publish(task, result, plan) {
         const catalog = loadCatalog();
         const bitbucket = new BitbucketClient();
@@ -997,7 +1024,8 @@ async function runWebhook(args: CliArgs, providerName: string): Promise<void> {
     process.exitCode = 1;
     return;
   }
-  const { watcher, jql, labels } = createWatcher({ ...args, dryRun: false }, providerName);
+  const triggerStatus = await resolveTriggerStatus();
+  const { watcher, jql, labels } = createWatcher({ ...args, dryRun: false }, providerName, triggerStatus);
   const jira = makeJira();
   const log = (m: string) => console.log(`[${new Date().toISOString()}] ${redactSecrets(m)}`);
   const reconcileMin = Number(process.env.WEBHOOK_RECONCILE_MINUTES ?? 15);
@@ -1046,9 +1074,11 @@ async function runWatch(args: CliArgs, providerName: string): Promise<void> {
     return;
   }
 
-  const { watcher, jql, labels } = createWatcher(args, providerName);
+  const triggerStatus = await resolveTriggerStatus();
+  const { watcher, jql, labels } = createWatcher(args, providerName, triggerStatus);
 
   console.log(`Watching Jira with: ${jql}`);
+  if (triggerStatus) console.log(`Status triggers: entering "${triggerStatus.plan}" starts planning, entering "${triggerStatus.implement}" approves and starts coding (labels also work).`);
   console.log(`AI: ${providerName} | start: label "${labels.ready}" | approval: ${process.env.AUTO_APPROVE_PLAN === 'true' ? 'AUTO (no human gate)' : `label "${labels.approved}"`} | coding: ${pipelineConfig().coding.enabled ? 'on' : 'OFF (config/pipeline.yaml coding.enabled)'}${args.dryRun ? ' | DRY RUN (no Jira writes, no AI runs)' : ''}`);
   try {
     if (args.once || args.dryRun) {

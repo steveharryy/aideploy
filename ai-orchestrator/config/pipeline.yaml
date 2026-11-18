@@ -26,7 +26,7 @@ planning:
   max_cost_usd_per_ticket: 5      # hard cap per planning run (passed to Claude Code)
   max_tool_calls: 80              # enforced by the planner tool server; real repos need ~15-45 (agent is warned 5 before the end)
   max_wall_clock_min: 20          # planning run is killed after this
-  max_question_rounds: 2          # then the ticket goes back to the reporter
+  max_question_rounds: 3          # then the ticket goes back to the reporter (matches the AI Agent Jira Workflow doc)
   max_plan_revisions: 3           # "request changes" rounds, then back to the reporter
 
 # Cheap checks before any AI call. Failing tickets go back to the reporter.
@@ -58,6 +58,21 @@ jira:
   # Optionally, show the phase on boards by moving tickets to EXISTING workflow statuses.
   # Off until the team agrees the mapping below; leave a phase empty to not move on it.
   move_status: false
+  # STATUS-DRIVEN MODE (off until a Jira admin has created the "AI Agent Jira Workflow" statuses).
+  # To turn it on: uncomment trigger_status, set move_status: true, replace the phase_status below
+  # with the block under "NEW WORKFLOW", then restart the watcher. If a status name does not exist in
+  # the project the watcher says so and keeps using labels, so a typo cannot break it.
+  #   trigger_status: { plan: AI Planning, implement: AI Dev }   # entering these statuses starts the pipeline
+  #
+  # NEW WORKFLOW phase_status (per project key):
+  #   T2:
+  #     needs_input: Needs Input
+  #     needs_info: Needs Input
+  #     plan_review: Plan Review
+  #     qa: AI QA              # independent re-test running
+  #     pr_open: Human Review  # PR raised, a person reviews it
+  #     needs_human: Needs Input
+  #   (planning = AI Planning and coding = AI Dev are the trigger statuses themselves: no move needed.)
   phase_status:
     RT:
       planning: In Solutioning
