@@ -33,6 +33,7 @@ interface JiraIssue {
   key: string;
   fields: {
     summary?: string;
+    created?: string;
     description?: AdfNode | string | null;
     labels?: string[];
     components?: Array<{ name: string }>;
@@ -96,7 +97,7 @@ export class JiraClient {
   }
 
   private get fields(): string[] {
-    const base = ['summary', 'description', 'labels', 'components', 'issuetype', 'status', 'priority', 'comment', 'parent', 'issuelinks', 'reporter'];
+    const base = ['summary', 'description', 'labels', 'components', 'issuetype', 'status', 'priority', 'comment', 'parent', 'issuelinks', 'reporter', 'created'];
     return [...base, this.acField, this.productField, this.storyPointsField].filter((f): f is string => !!f);
   }
 
@@ -361,6 +362,7 @@ export class JiraClient {
     if (this.acField && f[this.acField]) {
       acceptanceCriteria = toLines(adfToText(f[this.acField] as AdfNode | string));
     }
+    const acFieldCriteria = acceptanceCriteria;
     const extracted = extractAcceptanceCriteria(descriptionText);
     if (acceptanceCriteria.length === 0) {
       acceptanceCriteria = extracted.criteria;
@@ -374,6 +376,11 @@ export class JiraClient {
       metadata: {
         source: 'jira',
         url: `${this.baseUrl}/browse/${issue.key}`,
+        // For the ticket-template check: the description as written (headings, AC section included),
+        // the criteria from Jira's own acceptance-criteria field, and when the ticket was created.
+        descriptionText,
+        acFieldCriteria,
+        ...(f.created ? { created: f.created } : {}),
         labels: f.labels || [],
         components: (f.components || []).map((c) => c.name),
         issueType: f.issuetype?.name,

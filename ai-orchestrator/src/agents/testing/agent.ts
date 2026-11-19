@@ -4,7 +4,7 @@ import path from 'node:path';
 import { promisify } from 'node:util';
 import type { RepoTestResult, TestCheckResult, TestingResult } from '../../models/types.js';
 import type { VerifyCommand } from '../../catalog/service-catalog.js';
-import { newFailures } from '../../util/test-failures.js';
+import { failingTests, newFailures } from '../../util/test-failures.js';
 
 const execAsync = promisify(exec);
 
@@ -21,6 +21,8 @@ export interface TestingAgentConfig {
    * are not blocking). Undefined = none known, any failure blocks.
    */
   knownFailures?: (repoId: string) => string[] | undefined;
+  /** Retries of a failing test step before it counts as failed (workflow: 2). */
+  flakyRetries?: number;
 }
 
 export interface ITestingAgent {
@@ -42,6 +44,7 @@ export class TestingAgent implements ITestingAgent {
   private verifyCommands?: (repoId: string) => VerifyCommand[];
   private customTestRunner?: (repoId: string, repoPath: string) => Promise<RepoTestResult>;
   private knownFailures?: (repoId: string) => string[] | undefined;
+  private flakyRetries: number;
 
   constructor(config: TestingAgentConfig = {}) {
     this.repositoriesRoot = config.repositoriesRoot || path.resolve(process.cwd(), 'repositories');
@@ -49,6 +52,7 @@ export class TestingAgent implements ITestingAgent {
     this.verifyCommands = config.verifyCommands;
     this.customTestRunner = config.customTestRunner;
     this.knownFailures = config.knownFailures;
+    this.flakyRetries = config.flakyRetries ?? 2;
   }
 
   async runTests(affectedRepos: string[], workdirs: Record<string, string> = {}): Promise<TestingResult> {
@@ -118,7 +122,25 @@ export class TestingAgent implements ITestingAgent {
     if (contract.length > 0) {
       const known = this.knownFailures?.(repoId);
       for (const cmd of contract) {
-        const check = await this.runCheck(`verify:${cmd.name}`, cmd.run, repoPath, (cmd.timeoutSec ?? 600) * 1000);
+        let check = await this.runCheck(`verify:${cmd.name}`, cmd.run, repoPath, (cmd.timeoutSec ?? 600) * 1000);
+        // Flaky tests (workflow rule): a failing test step is retried up to 2 times. Passing on a retry
+        // = flaky, not a defect (noted, not blocking, not a loop). Different failures on every run =
+        // nondeterministic: blocks, tagged infra.
+        const onlyKnown = known?.length ? newFailures(`${check.output ?? ''}\n${check.error ?? ''}`, known)?.length === 0 : false;
+        if (!check.passed && !onlyKnown && /\btest\b/i.test(`${cmd.name} ${cmd.run}`)) {
+          const firstFailing = failingTests(`${check.output ?? ''}\n${check.error ?? ''}`);
+          for (let retry = 1; retry <= this.flakyRetries && !check.passed; retry++) {
+            const again = await this.runCheck(`verify:${cmd.name}`, cmd.run, repoPath, (cmd.timeoutSec ?? 600) * 1000);
+            if (again.passed) {
+              check = { ...again, output: `[flaky] failed on the first run, passed on retry ${retry}: ${(firstFailing ?? ['unidentified']).join('; ')}. Not caused by the change; worth an infra ticket.\n${again.output ?? ''}` };
+            } else {
+              const nowFailing = failingTests(`${again.output ?? ''}\n${again.error ?? ''}`);
+              const same = JSON.stringify(nowFailing) === JSON.stringify(firstFailing);
+              check = same ? again : { ...again, error: `[infra] nondeterministic test failures (different tests fail on each run): ${(nowFailing ?? []).join('; ')}\n${again.error ?? ''}` };
+              if (same) break; // the same tests fail again: a real failure, no more retries
+            }
+          }
+        }
         if (!check.passed && known?.length && /\btest\b/i.test(`${cmd.name} ${cmd.run}`)) {
           const fresh = newFailures(`${check.output ?? ''}\n${check.error ?? ''}`, known);
           if (fresh && fresh.length === 0) {

@@ -4,6 +4,7 @@ import type {
   ImpactAnalysisResult,
   OrchestrationStatus,
   OrchestratorResult,
+  QaStepResult,
   RepoBranchResult,
   TaskInput,
   TeamExecutionResult,
@@ -38,6 +39,12 @@ export interface OrchestratorOptions {
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
   /** Optional progress hook: called when the independent re-test starts (shown as the QA phase). Never fatal. */
   onStage?: (stage: 'testing') => void | Promise<void>;
+  /**
+   * AI QA (optional): after the re-test passes and before anything is committed, a separate QA agent
+   * verifies each repo's change against the ACs and the plan. Anything but "pass" stops the run with
+   * QA_FAILED (the caller decides: back to AI Dev, Needs Input, or a person).
+   */
+  qaStep?: (task: TaskInput, repos: string[], workdirs: Record<string, string>, testing: TestingResult) => Promise<QaStepResult>;
 }
 
 /** Read-only preview of what a run would do. */
@@ -59,6 +66,7 @@ export class Orchestrator {
   private resolveBaseBranch?: (repoId: string) => string | undefined;
   private approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
   private onStage?: (stage: 'testing') => void | Promise<void>;
+  private qaStep?: OrchestratorOptions['qaStep'];
 
   constructor(options: OrchestratorOptions) {
     this.aiProvider = options.aiProvider;
@@ -76,6 +84,7 @@ export class Orchestrator {
     this.resolveBaseBranch = options.resolveBaseBranch;
     this.approvePlan = options.approvePlan;
     this.onStage = options.onStage;
+    this.qaStep = options.qaStep;
     if (this.workspace && !this.resolveRepoPath) {
       throw new Error('Orchestrator: resolveRepoPath is required when a workspace manager is configured.');
     }
@@ -349,6 +358,26 @@ export class Orchestrator {
     }
     end('verify', 'passed', testingResult.summary);
 
+    // Step 4a (optional): AI QA, a separate agent that never edits code, verifies the change.
+    let qaResult: QaStepResult | undefined;
+    if (this.qaStep) {
+      this.log('AI QA', 'Verifying the change against the acceptance criteria and the plan...');
+      begin('qa');
+      try {
+        qaResult = await this.qaStep(task, impact.affectedRepositories, workdirs, testingResult);
+      } catch (err: unknown) {
+        const errorMessage = err instanceof Error ? err.message : String(err);
+        end('qa', 'failed', errorMessage);
+        return fail('QA_FAILED', `QA agent failed: ${errorMessage}`, { impact, deduplication, teamResult, testingResult, ...branchesIf(workspaces) });
+      }
+      if (qaResult.verdict !== 'pass') {
+        this.log('RESULT', `Stopped by AI QA (${qaResult.verdict}): ${qaResult.reason}`);
+        end('qa', 'failed', `${qaResult.verdict}: ${qaResult.reason}`);
+        return fail('QA_FAILED', qaResult.reason, { impact, deduplication, teamResult, testingResult, qaResult, ...branchesIf(workspaces) });
+      }
+      end('qa', 'passed', qaResult.reason);
+    }
+
     // Step 4b (optional): commit each repo's changes on its ticket branch (never pushed)
     const branches = toBranches(workspaces);
     if (this.workspace && workspaces.some((w) => w.managedByGit)) {
@@ -393,6 +422,7 @@ export class Orchestrator {
       deduplication,
       teamResult,
       testingResult,
+      ...(qaResult ? { qaResult } : {}),
       ...(workspaces.length > 0 ? { branches } : {}),
       durationMs: Date.now() - startTime
     };

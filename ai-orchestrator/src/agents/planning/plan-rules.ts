@@ -2,6 +2,7 @@ import type { WorkItem as CodingWorkItem } from '../coding/work-item.js';
 import { isBaselineFixFile, normaliseAcId } from '../coding/work-item.js';
 import type { TaskInput } from '../../models/types.js';
 import { CHECKLIST_ITEMS, CHECKLIST_LABELS, ESSENTIAL_ITEMS } from './types.js';
+import { devPlanRiskFloor, devPlanWarnings, devQaContext, devQaProblems, parseDevPlan, parseQaPlan } from './dev-qa-plan.js';
 import type {
   ChecklistItem,
   Confidence,
@@ -280,6 +281,19 @@ export function normalizePlan(raw: unknown, ticketId: string): TicketPlan {
     gapAnalysis,
     edgeCases
   };
+  const devPlan = parseDevPlan(pick(o, 'devPlan', 'dev_plan'));
+  const qaPlan = parseQaPlan(pick(o, 'qaPlan', 'qa_plan'));
+  if (devPlan) {
+    plan.devPlan = devPlan;
+    plan.warnings.push(...devPlanWarnings(devPlan));
+    const floor = devPlanRiskFloor(devPlan);
+    const rank = { low: 0, medium: 1, high: 2 } as const;
+    if (floor && rank[floor] > rank[plan.risk]) {
+      plan.riskReason = `${plan.riskReason ? `${plan.riskReason} ` : ''}(Raised to ${floor}: the plan changes ${floor === 'high' ? 'the database in a way old code may not survive' : 'database, secrets or infra'}.)`;
+      plan.risk = floor;
+    }
+  }
+  if (qaPlan) plan.qaPlan = qaPlan;
 
   // The decision rule: with a gap analysis, code decides the verdict, questions and what is missing.
   if (gapAnalysis.length) {
@@ -334,7 +348,7 @@ export function applyRiskFloor(plan: TicketPlan, task: TaskInput): TicketPlan {
  * Structural problems in a "ready" plan. A non-empty result means the plan must not be
  * offered for approval as-is.
  */
-export function validatePlan(plan: TicketPlan, knownRepos: string[], options: { requireGapAnalysis?: boolean } = {}): string[] {
+export function validatePlan(plan: TicketPlan, knownRepos: string[], options: { requireGapAnalysis?: boolean; requireDevQaPlan?: boolean } = {}): string[] {
   // Gap analysis completeness matters for every verdict: a forgotten item must never count as "found".
   const gapProblems = options.requireGapAnalysis || plan.gapAnalysis.length ? gapAnalysisProblems(plan) : [];
   // A repo outside the catalog is wrong whatever the verdict: the questions would be about the wrong code.
@@ -391,6 +405,8 @@ export function validatePlan(plan: TicketPlan, knownRepos: string[], options: { 
   if (plan.workItems.length > 1 && plan.contract.length === 0) {
     problems.push('Multi-repo plan has no shared contract (API shapes / field names the repos must agree on).');
   }
+  // The approval sheet: dev plan (DB, cache, secrets, infra, telemetry) and QA plan.
+  if (options.requireDevQaPlan || plan.devPlan || plan.qaPlan) problems.push(...devQaProblems(plan));
   return problems;
 }
 
@@ -535,7 +551,9 @@ export function workItemsForCoding(plan: TicketPlan, title: string): CodingWorkI
           ...plan.assumptions,
           ...plan.outOfScope.map((o) => `Out of scope: ${o}`),
           ...others.map((ac) => `${ac.id} is verified outside the code (${ac.verify}): ${ac.text}`),
-          ...(item.dependsOn.length ? [`Depends on work items: ${item.dependsOn.join(', ')}`] : [])
+          ...(item.dependsOn.length ? [`Depends on work items: ${item.dependsOn.join(', ')}`] : []),
+          // The approved dev/QA plan: DB, cache, telemetry to build; what must and must not happen.
+          ...devQaContext(plan)
         ],
         clarifications: plan.clarifications,
         ...(item.baselineFix ? { baselineFix: item.baselineFix } : {})

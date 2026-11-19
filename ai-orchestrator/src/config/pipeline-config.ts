@@ -12,6 +12,11 @@ export interface PipelineConfig {
   killSwitch: boolean;
   /** Coding phase on/off. Off: "ai-approved" is acknowledged but no code is written. */
   coding: { enabled: boolean };
+  /**
+   * AI QA (workflow doc): a separate agent verifies the change after coding. Defects send the work
+   * back to AI Dev, at most maxLoops times per approval (loop_count), then a person takes over.
+   */
+  qa: { enabled: boolean; maxLoops: number };
   promptVersion: string;
   planning: {
     /** "tools": only the six planner tools (MCP); "readonly": built-in Read/Glob/Grep. */
@@ -36,6 +41,10 @@ export interface PipelineConfig {
     allowedIssueTypes: string[];
     maxStoryPoints: number;
     assignToReporter: boolean;
+    /** Check every ticket against the standard template (config/ticket-template.yaml) before planning. */
+    template: boolean;
+    /** Only tickets created on/after this date (YYYY-MM-DD) are checked against the template. Empty = all. */
+    templateAppliesFrom: string;
   };
   jira: {
     productField?: string;
@@ -57,6 +66,7 @@ export interface PipelineConfig {
 export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
   killSwitch: false,
   coding: { enabled: false },
+  qa: { enabled: true, maxLoops: 3 },
   promptVersion: 'planning-v1',
   planning: {
     engine: 'tools',
@@ -77,7 +87,9 @@ export const DEFAULT_PIPELINE_CONFIG: PipelineConfig = {
     requireComponent: false,
     allowedIssueTypes: [],
     maxStoryPoints: 0,
-    assignToReporter: false
+    assignToReporter: false,
+    template: false,
+    templateAppliesFrom: ''
   },
   jira: { moveStatus: false, phaseStatus: {} },
   concurrency: { maxActiveSessions: 3 },
@@ -92,6 +104,16 @@ function num(v: unknown, fallback: number, name: string): number {
   if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) throw new Error(`Pipeline config: "${name}" must be a number >= 0.`);
   return v;
 }
+/** YYYY-MM-DD (YAML may give a Date object for an unquoted date). */
+function date(v: unknown, name: string): string {
+  if (v instanceof Date && !Number.isNaN(v.getTime())) return v.toISOString().slice(0, 10);
+  if (v === '' || v === null) return '';
+  if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v.trim()) || Number.isNaN(Date.parse(v))) {
+    throw new Error(`Pipeline config: "${name}" must be a date like 2026-11-18.`);
+  }
+  return v.trim();
+}
+
 function bool(v: unknown, fallback: boolean, name: string): boolean {
   if (v === undefined || v === null) return fallback;
   if (typeof v !== 'boolean') throw new Error(`Pipeline config: "${name}" must be true or false.`);
@@ -127,6 +149,10 @@ export function parsePipelineConfig(raw: unknown): PipelineConfig {
   return {
     killSwitch: bool(r.kill_switch, d.killSwitch, 'kill_switch'),
     coding: { enabled: bool(obj(r.coding).enabled, d.coding.enabled, 'coding.enabled') },
+    qa: {
+      enabled: bool(obj(r.qa).enabled, d.qa.enabled, 'qa.enabled'),
+      maxLoops: num(obj(r.qa).max_loops, d.qa.maxLoops, 'qa.max_loops')
+    },
     promptVersion: str(r.prompt_version, d.promptVersion, 'prompt_version') || d.promptVersion,
     planning: {
       engine: (() => {
@@ -155,6 +181,8 @@ export function parsePipelineConfig(raw: unknown): PipelineConfig {
         if (pi.allowed_issue_types !== undefined) o.allowedIssueTypes = strs(pi.allowed_issue_types, [], `${n}.allowed_issue_types`);
         if (pi.max_story_points !== undefined) o.maxStoryPoints = num(pi.max_story_points, 0, `${n}.max_story_points`);
         if (pi.assign_to_reporter !== undefined) o.assignToReporter = bool(pi.assign_to_reporter, false, `${n}.assign_to_reporter`);
+        if (pi.template !== undefined) o.template = bool(pi.template, false, `${n}.template`);
+        if (pi.template_applies_from !== undefined) o.templateAppliesFrom = date(pi.template_applies_from, `${n}.template_applies_from`);
         return [project.toUpperCase(), o];
       })
     ),
@@ -165,7 +193,9 @@ export function parsePipelineConfig(raw: unknown): PipelineConfig {
       requireComponent: bool(i.require_component, d.intake.requireComponent, 'intake.require_component'),
       allowedIssueTypes: strs(i.allowed_issue_types, d.intake.allowedIssueTypes, 'intake.allowed_issue_types'),
       maxStoryPoints: num(i.max_story_points, d.intake.maxStoryPoints, 'intake.max_story_points'),
-      assignToReporter: bool(i.assign_to_reporter, d.intake.assignToReporter, 'intake.assign_to_reporter')
+      assignToReporter: bool(i.assign_to_reporter, d.intake.assignToReporter, 'intake.assign_to_reporter'),
+      template: bool(i.template, d.intake.template, 'intake.template'),
+      templateAppliesFrom: i.template_applies_from === undefined ? d.intake.templateAppliesFrom : date(i.template_applies_from, 'intake.template_applies_from')
     },
     jira: {
       productField: fieldId(j.product_field, 'jira.product_field'),

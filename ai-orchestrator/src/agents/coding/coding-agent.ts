@@ -595,7 +595,12 @@ ${REPLY_SHAPE}`;
 }
 
 function workItemBlock(w: WorkItem): string {
-  return `<work_item>\n${JSON.stringify(w, null, 2)}\n</work_item>`;
+  const qa = w.qaFindings?.length
+    ? `\n\nQA REJECTED A PREVIOUS ATTEMPT of this work item. Fix every finding below; the QA agent re-checks each one by its ID and a finding that fails twice goes to a person. Cover each one with a test whose name contains the finding id and its AC id (e.g. test_AC1_F3_rejects_negative_amount).\n${w.qaFindings
+        .map((f) => `- ${f.id}${f.criterion ? ` (${f.criterion})` : ''}: ${f.title}${f.expected ? ` | expected: ${f.expected}` : ''}${f.actual ? ` | actual: ${f.actual}` : ''}${f.repro ? ` | repro: ${f.repro}` : ''}`)
+        .join('\n')}`
+    : '';
+  return `<work_item>\n${JSON.stringify(w, null, 2)}\n</work_item>${qa}`;
 }
 
 function testsFirstPrompt(w: WorkItem, purpose: string | undefined, testCommand: string): string {

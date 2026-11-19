@@ -12,18 +12,22 @@ import { MockAIProvider } from './providers/ai-provider.js';
 import { ClaudeProvider } from './providers/claude-provider.js';
 import { HandoffProvider } from './providers/handoff-provider.js';
 import { ClaudeCodeProvider, type ImplementationPlan } from './providers/claude-code-provider.js';
-import { PlanningAgent, PlanningRunError, type PlannerRepo } from './agents/planning/planning-agent.js';
+import { PlanningAgent, PlanningRunError, type PlannerRepo , type IntakeOutcome } from './agents/planning/planning-agent.js';
 import { codingBrief, repoDependencies, workItemsForCoding } from './agents/planning/plan-rules.js';
 import { renderMissing, renderPlan, renderQuestions } from './agents/planning/render.js';
 import type { PlanQuestion, TicketPlan } from './agents/planning/types.js';
 import { CodingAgentProvider } from './providers/coding-agent-provider.js';
 import type { CodingReport } from './agents/coding/coding-agent.js';
+import { workItemFromTask } from './agents/coding/work-item.js';
+import { QaAgent, type QaFinding, type QaReport } from './agents/qa/qa-agent.js';
+import { execFileSync } from 'node:child_process';
 import { JiraClient } from './integrations/jira/jira-client.js';
 import { describeSync, syncPlanningClones, type RepoSyncResult } from './workspace/repo-sync.js';
 import { ServiceCatalog } from './catalog/service-catalog.js';
 import { ComponentMap } from './catalog/component-map.js';
 import { intakeFor, killSwitchOn, loadPipelineConfig, type PipelineConfig } from './config/pipeline-config.js';
-import { runIntake } from './agents/intake/intake.js';
+import { runIntake, type IntakeResult } from './agents/intake/intake.js';
+import { loadTicketTemplate, renderChecks, templateText, type KnownRepo } from './agents/intake/ticket-template.js';
 import { JobStore, PROCESS_INSTANCE } from './jobs/job-store.js';
 import { FileSessionStore } from './jobs/session-store.js';
 import { GitWorkspaceManager } from './workspace/git-workspace.js';
@@ -39,7 +43,7 @@ import {
 } from './automation/watcher.js';
 import { startWebhookServer } from './automation/webhook-server.js';
 import { redactSecrets } from './util/redact.js';
-import type { ImpactAnalysisResult, OrchestratorResult, TaskInput } from './models/types.js';
+import type { ImpactAnalysisResult, OrchestratorResult, QaStepResult, TaskInput, TestingResult } from './models/types.js';
 
 dotenv.config();
 
@@ -56,6 +60,9 @@ const jobsDir = path.resolve(process.cwd(), process.env.JOBS_DIR || '.jobs');
 const pipelineConfigPath = process.env.PIPELINE_CONFIG_PATH
   ? path.resolve(process.cwd(), process.env.PIPELINE_CONFIG_PATH)
   : path.resolve(__dirname, '../config/pipeline.yaml');
+const ticketTemplatePath = process.env.TICKET_TEMPLATE_PATH
+  ? path.resolve(process.cwd(), process.env.TICKET_TEMPLATE_PATH)
+  : path.resolve(__dirname, '../config/ticket-template.yaml');
 const componentMapPath = process.env.COMPONENT_MAP_PATH
   ? path.resolve(process.cwd(), process.env.COMPONENT_MAP_PATH)
   : path.resolve(__dirname, '../config/components.yaml');
@@ -68,6 +75,32 @@ const killSwitch = () => killSwitchOn(pipelineConfigPath);
 
 function loadComponentMap(catalog: ServiceCatalog | undefined): ComponentMap | undefined {
   return ComponentMap.load(componentMapPath, catalog?.repos.map((r) => r.id));
+}
+
+/** Repos a ticket's "Target repo" section may name: catalog id, Bitbucket repo name, display name. */
+function knownRepos(catalog: ServiceCatalog | undefined): KnownRepo[] {
+  return (catalog?.repos ?? []).map((r) => ({
+    id: r.id,
+    names: [r.id, r.bitbucket?.repo, r.name].filter((n): n is string => !!n),
+    path: catalog!.resolvePath(r.id)
+  }));
+}
+
+/**
+ * Intake for one ticket: the basic checks plus (when on for the project) the standard ticket
+ * template. Read fresh each time, so edits to the template or config apply without a restart.
+ */
+function intakeCheck(task: TaskInput, catalog: ServiceCatalog | undefined, componentMap: ComponentMap | undefined): IntakeOutcome & { result: IntakeResult } {
+  const rules = intakeFor(pipelineConfig(), task.id);
+  const template = rules.template ? loadTicketTemplate(ticketTemplatePath) : undefined;
+  const result = runIntake(task, rules, componentMap, { template, repos: knownRepos(catalog) });
+  const issueType = typeof task.metadata?.issueType === 'string' ? (task.metadata.issueType as string) : 'Story';
+  return {
+    gaps: result.gaps,
+    checks: result.checks,
+    ...(result.gaps.length && template && result.templateChecked ? { template: templateText(template, issueType) } : {}),
+    result
+  };
 }
 
 /** Jira client with the custom fields the pipeline reads (Product, story points). */
@@ -111,6 +144,70 @@ export interface CreateOrchestratorOptions {
   approvePlan?: (task: TaskInput, impact: ImpactAnalysisResult) => Promise<boolean>;
   /** Progress hook: the independent re-test is starting (the watcher shows it as the QA phase). */
   onStage?: (stage: 'testing') => void | Promise<void>;
+  /** AI QA round for this run (from the watcher): round number, earlier findings, next free F-number. */
+  qa?: QaRunContext;
+}
+
+export interface QaRunContext {
+  round: number;
+  previous: QaFinding[];
+  nextId: number;
+}
+
+/** Saves a QA report next to the coding report (.jobs/<ticket>/qa-<repo>-r<round>.json). */
+function saveQaReport(report: QaReport): void {
+  const dir = path.join(jobsDir, report.ticket.replace(/[^A-Za-z0-9._-]/g, '_'));
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `qa-${report.repo}-r${report.round}.json`), JSON.stringify(report, null, 2));
+}
+
+/** The change QA verifies: the coding agent's diff for this ticket/repo, else the worktree's git diff. */
+function changeDiff(ticket: string, repo: string, workdir: string): string {
+  const file = path.join(jobsDir, ticket.replace(/[^A-Za-z0-9._-]/g, '_'), `changes-${repo}.diff`);
+  if (fs.existsSync(file)) return fs.readFileSync(file, 'utf-8');
+  try {
+    return execFileSync('git', ['-C', workdir, 'diff', 'HEAD'], { encoding: 'utf-8', maxBuffer: 20 * 1024 * 1024 });
+  } catch {
+    return '(diff unavailable: read the changed files directly)';
+  }
+}
+
+const QA_ORDER: QaStepResult['verdict'][] = ['pass', 'fail', 'needs_input', 'escalate'];
+
+/** One QA agent run per changed repo; the worst verdict wins. */
+function makeQaStep(catalog: ServiceCatalog | undefined, ctx: QaRunContext, knownFailures: Map<string, string[]>, repoPaths: Record<string, string>) {
+  return async (task: TaskInput, repos: string[], workdirs: Record<string, string>, testing: TestingResult): Promise<QaStepResult> => {
+    const agent = new QaAgent({ log: (m) => console.log(m) });
+    const approved = task.metadata?.approvedPlans as Record<string, ImplementationPlan> | undefined;
+    const previousIds = new Set(ctx.previous.map((f) => f.id));
+    let nextId = ctx.nextId;
+    const reports: QaReport[] = [];
+    for (const repo of repos) {
+      const workdir = workdirs[repo] || repoPaths[repo] || path.resolve(repoRoot, repo);
+      const checks = (testing.repoResults.find((r) => r.repoId === repo)?.checks ?? [])
+        .filter((c) => c.name !== 'directory-exists')
+        .map((c) => `${c.name}: ${c.passed ? 'passed' : 'FAILED'}`)
+        .join(', ');
+      const report = await agent.review({
+        workItem: workItemFromTask(task, repo, approved?.[repo]),
+        workdir,
+        diff: changeDiff(task.id, repo, workdir),
+        checks,
+        verify: catalog?.verifyCommands(repo) ?? [],
+        preExistingFailures: knownFailures.get(repo),
+        previous: ctx.previous,
+        round: ctx.round,
+        nextId,
+        repoPurpose: catalog?.get(repo)?.purpose
+      });
+      nextId += report.findings.filter((f) => !previousIds.has(f.id)).length;
+      saveQaReport(report);
+      reports.push(report);
+    }
+    const verdict = reports.reduce<QaStepResult['verdict']>((v, r) => (QA_ORDER.indexOf(r.verdict) > QA_ORDER.indexOf(v) ? r.verdict : v), 'pass');
+    const reason = reports.filter((r) => r.verdict !== 'pass').map((r) => `${r.repo}: ${r.reason}`).join(' ') || 'Every repo passed AI QA.';
+    return { verdict, reason, reports };
+  };
 }
 
 /** Loaded once: routing, repo paths, deploy order and verify contract (catalog/repos.yaml). */
@@ -183,7 +280,8 @@ export function createOrchestrator(providerType?: string, options: CreateOrchest
     resolveRepoPath: (repoId) => repoPaths[repoId] || path.resolve(repoRoot, repoId),
     resolveBaseBranch: (repoId) => catalog?.get(repoId)?.baseBranch,
     approvePlan: options.approvePlan,
-    onStage: options.onStage
+    onStage: options.onStage,
+    ...(options.qa && pipelineConfig().qa.enabled ? { qaStep: makeQaStep(catalog, options.qa, knownFailures, repoPaths) } : {})
   });
 }
 
@@ -254,7 +352,9 @@ function makePlanningAgent(catalog: ServiceCatalog | undefined, cfg: PipelineCon
     components: componentMap?.entries,
     toolServerEnv,
     // Intake (plain code) runs first: no tokens on tickets that are incomplete.
-    hardChecks: (task) => runIntake(task, intakeFor(cfg, task.id), componentMap).gaps,
+    hardChecks: (task) => intakeCheck(task, catalog, componentMap),
+    // The approval sheet: every ready plan carries the dev plan and QA plan (prompt planning-v5+).
+    requireDevQaPlan: !/^planning-v[1-4]$/.test(cfg.promptVersion),
     model: cfg.planning.model || undefined,
     timeoutMs: cfg.planning.maxWallClockMin > 0 ? cfg.planning.maxWallClockMin * 60 * 1000 : undefined,
     maxBudgetUsd: cfg.planning.maxCostUsdPerTicket || undefined
@@ -620,6 +720,8 @@ function printUsage(): void {
   npm start -- RT-123 --provider claude-code
                                     Full pipeline with Claude Code as the coding agent
                                     (same as AI_PROVIDER=claude-code; providers: mock, claude, claude-code, coding-agent, handoff)
+  npm start -- --check-ticket T2-1  Check a ticket against intake + the ticket template (no AI, no Jira writes)
+  npm start -- --template [bug]     Print the ticket template to copy into a Jira description (story, task, bug)
   npm start -- --status RT-123      Show a ticket's pipeline phase (history) and saved job state
   npm start -- --sessions           List every ticket's pipeline phase
   npm start -- --unlock RT-123      Remove a stuck lock for a ticket (only if no run is active)`);
@@ -642,6 +744,8 @@ interface CliArgs {
   status?: string;
   unlock?: string;
   sessions: boolean;
+  checkTicket?: string;
+  template?: string;
 }
 
 function parseArgs(argv: string[]): CliArgs {
@@ -662,6 +766,8 @@ function parseArgs(argv: string[]): CliArgs {
     else if (a === '--provider') args.provider = (argv[++i] || '').toLowerCase();
     else if (a === '--status') args.status = (argv[++i] || '').toUpperCase();
     else if (a === '--unlock') args.unlock = (argv[++i] || '').toUpperCase();
+    else if (a === '--check-ticket') args.checkTicket = (argv[++i] || '').toUpperCase();
+    else if (a === '--template') args.template = argv[i + 1] && !argv[i + 1].startsWith('-') ? argv[++i] : 'Story';
     else if (a === '-h' || a === '--help') args.help = true;
     else if (/^[A-Z][A-Z0-9_]+-\d+$/i.test(a)) args.keys.push(a.toUpperCase());
     else throw new Error(`Unrecognised argument: ${a}`);
@@ -979,7 +1085,9 @@ function createWatcher(args: CliArgs, providerName: string, triggerStatus?: { pl
           return { status, reason, repos: [], plans: {}, text: '' };
         }
       },
-      implement: (task, onStage) => createOrchestrator(providerName, { approvePlan: async () => true, onStage }).run(task),
+      implement: (task, onStage, qa) => createOrchestrator(providerName, { approvePlan: async () => true, onStage, ...(qa ? { qa } : {}) }).run(task),
+      qaEnabled: () => pipelineConfig().qa.enabled,
+      qaMaxLoops: () => pipelineConfig().qa.maxLoops,
       async publish(task, result, plan) {
         const catalog = loadCatalog();
         const bitbucket = new BitbucketClient();
@@ -1134,6 +1242,23 @@ async function main() {
     return;
   }
 
+  if (args.template) {
+    const type = { story: 'Story', task: 'Task', bug: 'Bug' }[args.template.toLowerCase()] ?? args.template;
+    console.log(templateText(loadTicketTemplate(ticketTemplatePath), type));
+    return;
+  }
+  if (args.checkTicket) {
+    const task = await makeJira().getTask(args.checkTicket);
+    const catalog = loadCatalog();
+    const rules = intakeFor(pipelineConfig(), task.id);
+    const out = intakeCheck(task, catalog, loadComponentMap(catalog));
+    console.log(`${task.id}: ${task.title}`);
+    console.log(`Template check: ${rules.template ? (out.result.templateChecked ? 'on' : 'on, but not applied to this ticket') : 'off for this project (intake.template)'}\n`);
+    for (const l of renderChecks(out.checks ?? [])) console.log(`  ${l}`);
+    console.log(out.gaps.length ? `\nNOT READY: ${out.gaps.length} thing(s) to fix before planning:\n${out.gaps.map((g) => `  - ${g}`).join('\n')}` : '\nREADY for planning.');
+    process.exitCode = out.gaps.length ? 1 : 0;
+    return;
+  }
   if (args.sessions) {
     const sessions = new FileSessionStore(jobsDir).list();
     if (!sessions.length) console.log('No sessions yet.');

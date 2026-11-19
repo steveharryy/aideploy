@@ -64,6 +64,22 @@
         "files": { "type": "array", "minItems": 1, "items": { "type": "string" } },
         "reason": { "type": "string" }
       }
+    },
+    "qaFindings": {
+      "type": "array",
+      "description": "Open QA defects from an earlier attempt (filled by the pipeline when AI QA sends the work back to AI Dev). Each is re-checked by ID.",
+      "items": {
+        "type": "object",
+        "required": ["id", "title"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^F\\d+$" },
+          "title": { "type": "string" },
+          "criterion": { "type": "string" },
+          "expected": { "type": "string" },
+          "actual": { "type": "string" },
+          "repro": { "type": "string" }
+        }
+      }
     }
   }
 }

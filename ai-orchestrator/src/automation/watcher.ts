@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { OrchestratorResult, TaskInput } from '../models/types.js';
+import type { OrchestratorResult, QaStepResult, TaskInput } from '../models/types.js';
 import type { ImplementationPlan } from '../providers/claude-code-provider.js';
 import type { PlanQuestion, TicketPlan } from '../agents/planning/types.js';
 import { againHow, renderMissing, renderQuestions } from '../agents/planning/render.js';
@@ -103,6 +103,20 @@ export interface SavedPlan {
   approvedAt?: string;
   /** Last version that was approved (then reopened). The revision limit counts from it. */
   lastApprovedVersion?: number;
+  /**
+   * AI QA history for this plan: every finding (F1, F2… numbered across rounds, never reused) and
+   * how many runs the QA loop started by itself (those are not counted as human-started attempts).
+   */
+  qa?: { round: number; findings: QaFindingRecord[]; autoRuns: number };
+}
+
+export type QaFindingRecord = QaStepResult['reports'][number]['findings'][number];
+
+/** What an implementation run needs to know about AI QA (round, earlier findings, next F-number). */
+export interface QaContext {
+  round: number;
+  previous: QaFindingRecord[];
+  nextId: number;
 }
 
 export interface WatcherJira {
@@ -124,7 +138,11 @@ export interface WatcherDeps {
   /** Dedup + impact + read-only change plan. */
   plan(task: TaskInput): Promise<PlanOutcome>;
   /** Full pipeline with the plan already approved. */
-  implement(task: TaskInput, onStage?: (stage: 'testing') => void | Promise<void>): Promise<OrchestratorResult>;
+  implement(task: TaskInput, onStage?: (stage: 'testing') => void | Promise<void>, qa?: QaContext): Promise<OrchestratorResult>;
+  /** AI QA switched on (config/pipeline.yaml qa.enabled). Absent = off. */
+  qaEnabled?: () => boolean;
+  /** loop_count cap: QA → AI Dev loops per approval before a person takes over (default 3). */
+  qaMaxLoops?: () => number;
   /** Push + open PRs for committed ticket branches (may return [] when no repo is a git clone). */
   publish(task: TaskInput, result: OrchestratorResult, plan: SavedPlan): Promise<{ links: PullRequestLink[]; skipped: string[] }>;
   /** Implementation attempts already made for this ticket (from the job record). */
@@ -692,7 +710,8 @@ export class AutomationWatcher {
 
     // Runs paused by a temporary Claude limit are not attempts.
     const paused = (this.sessions.get(task.id)?.history ?? []).filter((h) => h.detail?.startsWith('coding paused (temporary)')).length;
-    const attempts = Math.max(0, this.deps.attempts(task.id) - paused);
+    // …and neither are the runs the AI QA loop started by itself (they share one approval).
+    const attempts = Math.max(0, this.deps.attempts(task.id) - paused - (plan.qa?.autoRuns ?? 0));
     if (attempts >= this.config.maxAttempts) {
       this.deps.log(`${task.id}: retry limit reached (${attempts}/${this.config.maxAttempts})`);
       if (this.config.dryRun) return 'retry-limit';
@@ -732,9 +751,39 @@ export class AutomationWatcher {
           }
         : {})
     };
-    const result = await this.deps.implement(fresh, async (stage) => {
-      if (stage === 'testing') await this.toPhase(task.id, 'qa', [], 'independent re-test of the applied changes');
-    });
+    // AI Dev ⇄ AI QA: QA defects go back to AI Dev automatically (loop_count), at most qaMaxLoops
+    // times for this approval; then a person takes over. Each finding keeps its F-number for good.
+    const qaOn = this.deps.qaEnabled?.() ?? false;
+    const maxLoops = Math.max(1, this.deps.qaMaxLoops?.() ?? 3);
+    const onStage = async (stage: 'testing') => {
+      if (stage === 'testing') await this.toPhase(task.id, 'qa', [], 'AI QA: re-test and QA agent verify the change');
+    };
+    let loops = 0;
+    let result: OrchestratorResult;
+    for (;;) {
+      const qaState = plan.qa ?? { round: 0, findings: [], autoRuns: 0 };
+      const open = qaState.findings.filter((f) => f.type === 'defect' && f.status === 'open');
+      result = await this.deps.implement(
+        withQaFindings(fresh, open),
+        onStage,
+        qaOn ? { round: qaState.round + 1, previous: qaState.findings, nextId: nextFindingNumber(qaState.findings) } : undefined
+      );
+      if (!result.qaResult) break; // QA did not run (off, or the run stopped before it)
+      const qa = result.qaResult;
+      plan.qa = { round: qaState.round + 1, findings: mergeFindings(qaState.findings, qa), autoRuns: qaState.autoRuns };
+      this.savePlan(plan);
+      if (result.status !== 'QA_FAILED' || qa.verdict !== 'fail') break;
+      loops++;
+      if (loops >= maxLoops) break;
+      plan.qa.autoRuns++;
+      this.savePlan(plan);
+      this.deps.log(`${task.id}: AI QA found defects → back to AI Dev (loop ${loops}/${maxLoops})`);
+      await this.comment(task.id, [
+        ...qaLines(qa, plan.qa.round),
+        `Back to AI Dev automatically to fix ${qa.reports.flatMap((r) => r.findings.filter((f) => f.round === plan.qa!.round && f.type === 'defect' && f.status === 'open').map((f) => f.id)).join(', ')} (loop ${loops} of ${maxLoops}). Nothing was committed or pushed.`
+      ]);
+      await this.toPhase(task.id, 'coding', [], `AI QA loop ${loops}/${maxLoops}: fixing ${qa.reason}`);
+    }
 
     const changed = (result.teamResult?.repoResults ?? []).map((r) => `${r.repoId}: ${r.changedFiles.join(', ') || 'no file changes'}`);
     const verify = (result.testingResult?.repoResults ?? []).flatMap((r) =>
@@ -754,13 +803,39 @@ export class AutomationWatcher {
       return 'skipped';
     }
 
+    if (result.status === 'QA_FAILED' && result.qaResult) {
+      const qa = result.qaResult;
+      const round = plan.qa?.round ?? 1;
+      const tag = qa.reports.find((r) => r.verdict === qa.verdict)?.tag;
+      const questions = qa.reports.flatMap((r) => r.questions.map((q) => `${r.repo}: ${q}`));
+      const lines = [...qaLines(qa, round)];
+      let detail: string;
+      if (qa.verdict === 'needs_input' && tag !== 'infra') {
+        lines.push('AI QA needs an answer before it can pass this change:', ...questions.map((q) => `- ${q}`), `Reply in a comment, then ${this.again('approved')} to re-run AI Dev and AI QA with your answer.`);
+        detail = `AI QA needs input [${tag ?? 'product'}]: return_to AI QA`;
+      } else if (qa.verdict === 'needs_input') {
+        lines.push('Tagged infra: this looks like an environment or flaky-test problem, not the change. It does not count as a loop. DevOps should check it, then ' + this.again('approved') + '.');
+        detail = 'AI QA needs input [infra]: flaky or environment failure';
+      } else if (qa.verdict === 'fail') {
+        lines.push(`AI could not converge: AI QA still found defects after ${loops} loop(s) back to AI Dev (limit ${maxLoops}). A person takes over: fix by hand, clarify the ticket and ${this.again('approved')}, or discard.`);
+        detail = `AI QA: could not converge after ${loops} loop(s)`;
+      } else {
+        lines.push(`Escalated to a person: ${qa.reason}`);
+        detail = `AI QA escalated [${tag ?? 'technical'}]: ${qa.reason}`;
+      }
+      this.deps.log(`${task.id}: ${detail}`);
+      await this.comment(task.id, lines);
+      await this.toPhase(task.id, qa.verdict === 'needs_input' && tag !== 'infra' ? 'needs_input' : 'needs_human', [], detail);
+      return qa.verdict === 'needs_input' ? 'needs-input' : 'failed';
+    }
+
     if (!result.success) {
       const failedCheck = (result.testingResult?.repoResults ?? [])
         .flatMap((r) => r.checks.filter((c) => !c.passed).map((c) => `${r.repoId} ${c.name}:\n${(c.error || c.output || '').trim().split('\n').slice(-15).join('\n')}`))
         .join('\n\n');
       await this.comment(
         task.id,
-        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), `A person needs to look at this. To retry with the same approved plan, ${this.again('approved')}.`],
+        [`Implementation stopped: ${result.status}.`, `Reason: ${result.error ?? '-'}`, ...(verify.length ? ['Verify:', ...verify] : []), ...(failedCheck.includes('[infra]') ? ['Tagged infra: different tests failed on each run, so this looks like an environment or flaky-test problem, not the change. DevOps should check it.'] : []), `A person needs to look at this. To retry with the same approved plan, ${this.again('approved')}.`],
         failedCheck || undefined
       );
       await this.toPhase(task.id, 'needs_human', [], `implementation stopped: ${result.status}`);
@@ -781,6 +856,7 @@ export class AutomationWatcher {
         'Changed files:',
         ...changed,
         ...quality,
+        ...(result.qaResult ? qaLines(result.qaResult, plan.qa?.round ?? 1, true) : []),
         'Verify (re-run after applying):',
         ...verify
       ]);
@@ -826,6 +902,57 @@ export class AutomationWatcher {
  * Only used when the coding agent actually produced this run's change, so a stale report from an
  * earlier run (e.g. with another provider) is never shown.
  */
+/** The next free finding number: F-numbers are never reused across rounds. */
+export function nextFindingNumber(findings: QaFindingRecord[]): number {
+  return findings.reduce((n, f) => Math.max(n, Number(/^F(\d+)$/i.exec(f.id)?.[1] ?? 0)), 0) + 1;
+}
+
+/** Earlier findings updated by this QA run (by ID), plus its new ones. */
+export function mergeFindings(previous: QaFindingRecord[], qa: QaStepResult): QaFindingRecord[] {
+  const byId = new Map(previous.map((f) => [f.id, f]));
+  for (const f of qa.reports.flatMap((r) => r.findings)) byId.set(f.id, f);
+  return [...byId.values()].sort((a, b) => nextFindingNumber([a]) - nextFindingNumber([b]));
+}
+
+/** The ticket for the next AI Dev run, with each repo's open QA defects on its work item. */
+export function withQaFindings(task: TaskInput, open: QaFindingRecord[]): TaskInput {
+  const items = task.metadata?.workItems as Array<Record<string, unknown> & { repo: string }> | undefined;
+  if (!open.length || !items) return task;
+  return {
+    ...task,
+    metadata: {
+      ...task.metadata,
+      workItems: items.map((w) => {
+        const mine = open.filter((f) => f.repo === w.repo);
+        return mine.length
+          ? { ...w, qaFindings: mine.map((f) => ({ id: f.id, title: f.title, criterion: f.criterion, expected: f.expected, actual: f.actual, repro: f.repro })) }
+          : w;
+      })
+    }
+  };
+}
+
+/** AI QA result as Jira comment lines: verdict, then every finding of this round and re-checked ones. */
+export function qaLines(qa: QaStepResult, round: number, passed = false): string[] {
+  const label: Record<string, string> = { defect: 'defect', spec_ambiguity: 'unclear spec', flaky: 'flaky / environment', pre_existing: 'already failing before', out_of_scope: 'out of scope' };
+  const lines = [`AI QA round ${round}: ${qa.verdict.toUpperCase()}. ${qa.reason}`];
+  for (const r of qa.reports) {
+    const shown = r.findings.filter((f) => f.round === round || f.status === 'fixed' || (f.type === 'defect' && f.status === 'open'));
+    if (r.summary) lines.push(`${r.repo}: ${r.summary}`);
+    for (const f of shown) {
+      const state = f.round === round ? (f.status === 'open' ? 'open' : f.status === 'waived' ? 'not blocking' : f.status) : f.status === 'fixed' ? 'FIXED (re-checked)' : 'STILL OPEN (re-checked)';
+      lines.push(
+        `- ${f.id} [${label[f.type] ?? f.type}${f.criterion ? `, ${f.criterion}` : ''}] ${state}: ${f.title}${f.expected ? ` | expected: ${f.expected}` : ''}${f.actual ? ` | actual: ${f.actual}` : ''}${f.repro ? ` | repro: ${f.repro}` : ''}${f.file ? ` | ${f.file}${f.line ? `:${f.line}` : ''}` : ''}`
+      );
+    }
+    if (r.restoredFiles.length) lines.push(`- The QA agent changed ${r.restoredFiles.join(', ')}; restored (QA never edits code).`);
+  }
+  const followUps = qa.reports.flatMap((r) => r.findings.filter((f) => f.round === round && f.type === 'out_of_scope'));
+  if (followUps.length) lines.push(`Suggested follow-up ticket(s), not part of this change: ${followUps.map((f) => `${f.id} ${f.title}`).join('; ')}`);
+  if (passed && !lines.slice(1).some((l) => l.startsWith('- '))) lines.push('No findings.');
+  return lines;
+}
+
 export function readCodingReport(jobsDir: string, result: OrchestratorResult, ticketId: string, repoId: string): CodingReport | undefined {
   const repo = result.teamResult?.repoResults.find((r) => r.repoId === repoId);
   if (!repo || repo.providerUsed !== 'coding-agent') return undefined;

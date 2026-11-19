@@ -118,7 +118,27 @@ export type OrchestrationStatus =
   | 'PLAN_REJECTED'
   | 'DEDUPLICATION_FAILED'
   | 'EXECUTION_FAILED'
-  | 'TEST_FAILED';
+  | 'TEST_FAILED'
+  | 'QA_FAILED';
+
+/** AI QA step outcome (see src/agents/qa/qa-agent.ts). */
+export interface QaStepResult {
+  verdict: 'pass' | 'fail' | 'needs_input' | 'escalate';
+  reason: string;
+  /** One QaReport per repo (typed loosely here to keep models free of agent imports). */
+  reports: Array<{
+    repo: string;
+    round: number;
+    verdict: 'pass' | 'fail' | 'needs_input' | 'escalate';
+    reason: string;
+    summary: string;
+    findings: Array<{ id: string; type: 'defect' | 'spec_ambiguity' | 'flaky' | 'pre_existing' | 'out_of_scope'; repo: string; criterion?: string; title: string; expected?: string; actual?: string; repro?: string; file?: string; line?: number; status: 'open' | 'fixed' | 'waived'; round: number }>;
+    acResults: Array<{ id: string; met: boolean; evidence: string }>;
+    questions: string[];
+    tag?: 'product' | 'technical' | 'infra';
+    restoredFiles: string[];
+  }>;
+}
 
 /** Where and on which branch a repo's changes for this ticket live. */
 export interface RepoBranchResult {
@@ -137,6 +157,8 @@ export interface OrchestratorResult {
   deduplication?: DeduplicationResult;
   teamResult?: TeamExecutionResult;
   testingResult?: TestingResult;
+  /** AI QA verdict and findings (only when a QA step is configured). */
+  qaResult?: QaStepResult;
   /** Per-repo branch/worktree/commit (only when a workspace manager is configured). */
   branches?: RepoBranchResult[];
   /** Path of the persisted job state (only when a job store is configured). */

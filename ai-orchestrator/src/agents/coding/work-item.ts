@@ -33,6 +33,11 @@ export interface WorkItem {
    * test-runner config (never source). Without this, a red baseline stops the agent.
    */
   baselineFix?: { files: string[]; reason: string };
+  /**
+   * Open QA defects from an earlier attempt (AI QA sent the work back to AI Dev). Each must be fixed;
+   * the QA agent re-checks them by ID. Filled by the pipeline, never by the planner.
+   */
+  qaFindings?: Array<{ id: string; title: string; criterion?: string; expected?: string; actual?: string; repro?: string }>;
 }
 
 /** Test-runner / build config files (package.json, tsconfig*.json, jest/vitest config, pytest config). */

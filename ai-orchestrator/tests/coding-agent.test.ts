@@ -521,7 +521,7 @@ describe('Work item contract files (shared with the planning agent)', () => {
 
   it('JSON Schema and validator agree on required fields and properties', () => {
     expect(schema.required.sort()).toEqual(['acceptanceCriteria', 'repo', 'summary', 'testPlan', 'ticket', 'title', 'workItemId']);
-    const typed: Array<keyof WorkItem> = ['ticket', 'workItemId', 'repo', 'title', 'summary', 'acceptanceCriteria', 'testPlan', 'plannedFiles', 'contract', 'assumptions', 'clarifications', 'baselineFix'];
+    const typed: Array<keyof WorkItem> = ['ticket', 'workItemId', 'repo', 'title', 'summary', 'acceptanceCriteria', 'testPlan', 'plannedFiles', 'contract', 'assumptions', 'clarifications', 'baselineFix', 'qaFindings'];
     expect(Object.keys(schema.properties).sort()).toEqual([...typed].sort());
     // Every schema-required field is enforced by the validator too.
     for (const field of schema.required) {

@@ -14,6 +14,7 @@ import {
 } from '../../providers/claude-code-provider.js';
 import { applyRiskFloor, hardChecks, normalizePlan, PlanParseError, validatePlan } from './plan-rules.js';
 import type { PlanQuestion, RiskLevel, TicketPlan } from './types.js';
+import type { CheckRow } from '../intake/ticket-template.js';
 import { maxRisk, type ComponentEntry } from '../../catalog/component-map.js';
 import { TOOL_DEFINITIONS, type PlannerOutcome, type PlannerSession, type ToolCallRecord } from './tools.js';
 
@@ -21,6 +22,13 @@ import { TOOL_DEFINITIONS, type PlannerOutcome, type PlannerSession, type ToolCa
  * tools:    Claude Code with ONLY the six planner tools (served by mcp-server.ts); no built-in tools.
  * readonly: Claude Code with built-in Read/Glob/Grep; the plan comes back as a JSON answer.
  */
+/** What intake hands the planner: gaps (any = stop), every check, and the template to copy. */
+export interface IntakeOutcome {
+  gaps: string[];
+  checks?: CheckRow[];
+  template?: string;
+}
+
 export type PlanningEngine = 'tools' | 'readonly';
 
 /** What the planner needs to know about each repo it may choose. */
@@ -43,7 +51,13 @@ export interface PlanningAgentConfig {
   /** Cost cap for one planning run in USD (0/undefined = none). */
   maxBudgetUsd?: number;
   /** Checks that run before the model (default: the basic description checks). Gaps → too_vague. */
-  hardChecks?: (task: TaskInput) => string[];
+  /**
+   * Intake (plain code) before any tokens. Either the gaps alone, or the gaps plus the full
+   * checklist (shown on the ticket) and the copy-paste template for a ticket that fails.
+   */
+  hardChecks?: (task: TaskInput) => string[] | IntakeOutcome;
+  /** Require the dev plan + QA plan (approval sheet) in every "ready" plan. */
+  requireDevQaPlan?: boolean;
   /** Default: "tools" when a system prompt is given, else "readonly". */
   engine?: PlanningEngine;
   /** System prompt for the tools engine (prompts/<version>.md). Required for engine "tools". */
@@ -105,7 +119,7 @@ export class PlanningAgent {
   private model?: string;
   private timeoutMs: number;
   private maxBudgetUsd?: number;
-  private checks: (task: TaskInput) => string[];
+  private checks: (task: TaskInput) => string[] | IntakeOutcome;
   private runner: ClaudeCodeRunner;
   readonly engine: PlanningEngine;
   private systemPrompt?: string;
@@ -113,6 +127,7 @@ export class PlanningAgent {
   private allowedProjects?: string[];
   private components: ComponentEntry[];
   private toolServerEnv: Record<string, string>;
+  private requireDevQaPlan: boolean;
 
   constructor(config: PlanningAgentConfig) {
     this.repos = config.repos;
@@ -127,21 +142,34 @@ export class PlanningAgent {
     this.allowedProjects = config.allowedProjects;
     this.components = config.components || [];
     this.toolServerEnv = config.toolServerEnv || {};
+    this.requireDevQaPlan = config.requireDevQaPlan ?? false;
     if (this.engine === 'tools' && !this.systemPrompt) throw new Error('PlanningAgent: the "tools" engine needs a system prompt.');
     this.runner = config.runner || runClaudeCli;
   }
 
   async plan(task: TaskInput, request: PlanRequest = {}): Promise<PlanningResult> {
     // 1. Hard checks: no tokens spent on tickets that are obviously incomplete.
-    const gaps = this.checks(task);
-    if (gaps.length > 0) {
+    const raw = this.checks(task);
+    const intake: IntakeOutcome = Array.isArray(raw) ? { gaps: raw } : raw;
+    const extra = {
+      ...(intake.checks?.length ? { intakeChecks: intake.checks } : {}),
+      ...(intake.template ? { templateText: intake.template } : {})
+    };
+    if (intake.gaps.length > 0) {
       return {
-        plan: emptyPlan(task.id, 'too_vague', { missingForReporter: gaps, summary: 'Stopped by the basic ticket checks before planning.' }),
+        plan: emptyPlan(task.id, 'too_vague', { missingForReporter: intake.gaps, summary: 'Stopped by the basic ticket checks before planning.', ...extra }),
         problems: [],
         modelCalled: false,
         stats: ''
       };
     }
+    const result = await this.planChecked(task, request);
+    // The passed checklist travels with the plan (shown to the approver); the template is not needed.
+    if (intake.checks?.length) result.plan = { ...result.plan, intakeChecks: intake.checks };
+    return result;
+  }
+
+  private async planChecked(task: TaskInput, request: PlanRequest): Promise<PlanningResult> {
 
     if (this.engine === 'tools') return this.planWithTools(task, request);
 
@@ -205,7 +233,7 @@ export class PlanningAgent {
           .map((w) => `${w.repo}: its existing tests already fail on the base branch. Approving this plan lets the coding agent first repair them, touching only ${w.baselineFix!.files.join(', ')} (${w.baselineFix!.reason}).`)
       ]
     };
-    const problems = [...new Set([...validatePlan(plan, this.repos.map((r) => r.id), { requireGapAnalysis }), ...(plan.readiness === 'ready' ? extraProblems : [])])];
+    const problems = [...new Set([...validatePlan(plan, this.repos.map((r) => r.id), { requireGapAnalysis, requireDevQaPlan: this.requireDevQaPlan && requireGapAnalysis }), ...(plan.readiness === 'ready' ? extraProblems : [])])];
     // A plan for code the agent could not read is a guess. That is a pipeline setup problem
     // (not the reporter's), so it is flagged for every verdict and goes to a person, not back to the reporter.
     for (const w of plan.workItems) {
@@ -232,7 +260,8 @@ export class PlanningAgent {
         repos: this.repos.map((r) => ({ id: r.id, name: r.name, purpose: r.purpose, path: r.path })),
         components: this.components,
         maxToolCalls: this.maxToolCalls,
-        resultFile
+        resultFile,
+        ...(this.requireDevQaPlan ? { requireDevQaPlan: true } : {})
       };
       const sessionFile = path.join(dir, 'session.json');
       fs.writeFileSync(sessionFile, JSON.stringify(session), { mode: 0o600 });

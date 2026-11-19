@@ -444,4 +444,18 @@ describe('AI Orchestrator Pipeline', () => {
     expect(repoIds).toContain('repo-b');
     expect(repoIds).toContain('repo-c');
   });
+
+  it('AI QA: a non-pass verdict stops the run with QA_FAILED before anything is committed; pass completes', async () => {
+    const calls: string[][] = [];
+    const qa = (verdict: 'pass' | 'fail') => async (_t: TaskInput, repos: string[]) => {
+      calls.push(repos);
+      return { verdict, reason: `${verdict}!`, reports: [] };
+    };
+    const failed = await new Orchestrator({ aiProvider: new MockAIProvider(), silent: true, qaStep: qa('fail') }).run({ ...sampleTask, id: 'PAY-QA1' });
+    expect(failed).toMatchObject({ success: false, status: 'QA_FAILED', error: 'fail!', qaResult: { verdict: 'fail' } });
+    expect(failed.testingResult?.overallSuccess).toBe(true); // QA runs only after the re-test passed
+    const passed = await new Orchestrator({ aiProvider: new MockAIProvider(), silent: true, qaStep: qa('pass') }).run({ ...sampleTask, id: 'PAY-QA2', title: 'Add status endpoint' });
+    expect(passed).toMatchObject({ success: true, status: 'COMPLETED', qaResult: { verdict: 'pass' } });
+    expect(calls.every((r) => r.includes('repo-a'))).toBe(true);
+  });
 });

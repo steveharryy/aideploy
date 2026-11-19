@@ -1,0 +1,129 @@
+# Standard ticket template: every ticket must pass this before planning (and so before any development).
+#
+# Intake (plain code, no AI, free) splits the Jira description into sections by their headings and
+# checks each one. A failed REQUIRED section sends the ticket back to the reporter with a full
+# ✓/✗ checklist and this template to copy; nothing is planned. Warnings are shown but do not block.
+# Turn it on per project in config/pipeline.yaml: intake.template / projects.<KEY>.intake.template.
+# Override the path with TICKET_TEMPLATE_PATH. Print the copy-paste text: npm start -- --template story
+#
+# Fields per section:
+#   id                 stable id (used in code and tests)
+#   title              the heading people write (case and a trailing ":" do not matter)
+#   aliases            other headings accepted for the same section
+#   hint               what to write; shown in the template and in the "missing" message
+#   required_for       issue types where a missing/empty section BLOCKS planning
+#   warn_for           issue types where it is shown as a warning only
+#   required_if_money  blocks for every issue type when the ticket mentions money (money_keywords)
+#   min_chars          minimum real content (letters/digits, placeholders like <...> removed)
+#   min_items          minimum number of list items / lines (acceptance criteria)
+#   check              extra check:  repo  = must name a repo from catalog/repos.yaml
+#                                    paths = file/folder paths named here must exist in the target repo (warning)
+#                                    ac    = items counted, also from Jira's acceptance-criteria field
+
+money_keywords: [wallet, balance, payout, payment, withdraw, withdrawal, deposit, refund, bonus, prize, winnings,
+                 odds, stake, bet, contest, transaction, ledger, commission, cashback, LKR, INR, currency]
+
+sections:
+  - id: problem
+    title: Problem
+    aliases: [background, context, why, problem statement, business need]
+    hint: Why we need this. Who is affected and how (users, money, data). 1-3 sentences.
+    required_for: [Story, Task, Bug]
+    min_chars: 30
+
+  - id: target_repo
+    title: Target repo
+    aliases: [repo, repository, repositories, target repository, target service, service, services]
+    hint: The repo(s) the change goes in, as named in Bitbucket, e.g. gb-payments-api-service.
+    required_for: [Story, Task, Bug]
+    min_chars: 3
+    check: repo
+
+  - id: source
+    title: Source location
+    aliases: [source, code location, where, affected code, files, file, module, endpoint, api, screen]
+    hint: Where in the repo. File or folder (src/utils/getUserIP.ts), API endpoint (POST /withdrawals) or screen. Write "not sure" if unknown.
+    required_for: [Story, Task, Bug]
+    min_chars: 6
+    check: paths
+
+  - id: steps
+    title: Steps to reproduce
+    aliases: [steps, repro steps, reproduction steps, how to reproduce]
+    hint: Numbered steps that show the bug.
+    required_for: [Bug]
+    min_chars: 20
+
+  - id: current
+    title: Current behaviour
+    aliases: [current behavior, actual result, actual behaviour, actual behavior, today, as is]
+    hint: What happens today (Bug - the wrong result, error text or status code).
+    required_for: [Bug]
+    warn_for: [Story, Task]
+    min_chars: 20
+
+  - id: expected
+    title: Expected behaviour
+    aliases: [expected behavior, expected result, what to change, requirement, requirements, to be, desired behaviour]
+    hint: What should happen after the change. Concrete and testable.
+    required_for: [Story, Task, Bug]
+    min_chars: 30
+
+  - id: acceptance
+    title: Acceptance criteria
+    aliases: [acceptance criterion, ac, acs]
+    hint: "Numbered: AC1: Given <state>, when <action>, then <result>."
+    required_for: [Story, Task, Bug]
+    min_items: 1
+    min_chars: 20
+    check: ac
+
+  - id: examples
+    title: Examples
+    aliases: [example, sample, input output, test data]
+    hint: At least one concrete input and its expected output (a table works well).
+    required_for: [Story, Task, Bug]
+    min_chars: 10
+
+  - id: edge_cases
+    title: Edge cases and money rules
+    aliases: [edge cases, edge case, money rules, corner cases, risks]
+    hint: Limits, rounding, currency, time zones, statuses, duplicates/retries, empty values. Write "None, because ..." if there are none.
+    warn_for: [Story, Task, Bug]
+    required_if_money: true
+    min_chars: 10
+
+  - id: out_of_scope
+    title: Out of scope
+    aliases: [not in scope, non goals, scope, do not change]
+    hint: What must NOT change (callers, APIs, DB schema, other products).
+    required_for: [Story, Task, Bug]
+    min_chars: 10
+
+  - id: verify
+    title: How to verify
+    aliases: [verification, how to test, testing, test plan, qa notes]
+    hint: Unit tests per AC, an API call and its response, or the screen to check.
+    required_for: [Story, Task, Bug]
+    min_chars: 10
+
+  - id: environment
+    title: Environment and evidence
+    aliases: [environment, evidence, logs, env]
+    hint: Env (prod / QA / LK), platform, app version; trace id, log line, transaction id or screenshot.
+    warn_for: [Bug]
+    min_chars: 10
+
+  - id: links
+    title: Links
+    aliases: [references, docs, design, figma, related tickets]
+    hint: Figma, API or vendor docs, related tickets.
+    warn_for: []
+    min_chars: 5
+
+  - id: rollout
+    title: Rollout
+    aliases: [deployment notes, migration, feature flag, config]
+    hint: Feature flag, DB migration, config or env change, backward compatibility.
+    warn_for: []
+    min_chars: 5

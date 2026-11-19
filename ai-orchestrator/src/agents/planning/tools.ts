@@ -34,6 +34,8 @@ export interface PlannerSession {
   components: ComponentEntry[];
   maxToolCalls: number;
   resultFile: string;
+  /** The plan must carry the dev plan and QA plan (approval sheet). */
+  requireDevQaPlan?: boolean;
 }
 
 export interface ToolCallRecord {
@@ -215,7 +217,57 @@ export const TOOL_DEFINITIONS = [
             },
             risk: { type: 'string', enum: ['low', 'medium', 'high'] },
             risk_reason: { type: 'string' },
-            out_of_scope: { type: 'array', items: { type: 'string' } }
+            out_of_scope: { type: 'array', items: { type: 'string' } },
+            dev_plan: {
+              type: 'object',
+              description: 'Approval sheet, dev half. Answer EVERY section: the changes in items, or "none" with the reason nothing changes. Only what you saw in the code or ticket; never secret values.',
+              properties: {
+                new_repos: {
+                  type: 'array',
+                  description: 'Only repos that do NOT exist yet and must be created. Existing repos to update are work_items.',
+                  items: { type: 'object', properties: { name: { type: 'string' }, purpose: { type: 'string' }, summary: { type: 'string', description: 'what goes in it for this ticket' } }, required: ['name', 'summary'] }
+                },
+                db_changes: { type: 'object', description: 'Per table', properties: { none: { type: 'string', description: 'Why nothing changes here (when items is empty)' }, items: { type: 'array', items: { type: 'object', properties: { repo: { type: 'string' }, database: { type: 'string' }, table: { type: 'string' }, change: { type: 'string', enum: ['create_table', 'add_column', 'alter_column', 'drop_column', 'drop_table', 'index', 'data_migration', 'query_only'] }, summary: { type: 'string' }, migration: { type: 'string', description: 'migration file or script (placeholder name allowed)' }, backward_compatible: { type: 'boolean', description: 'old code keeps working on the new schema' } }, required: ['table', 'change', 'summary', 'backward_compatible'] } } } },
+                cache_changes: { type: 'object', description: 'Per cache key (Redis etc.)', properties: { none: { type: 'string', description: 'Why nothing changes here (when items is empty)' }, items: { type: 'array', items: { type: 'object', properties: { repo: { type: 'string' }, key: { type: 'string', description: 'key or pattern, e.g. user:{id}:wallet' }, change: { type: 'string', enum: ['create', 'update', 'delete', 'invalidate', 'ttl_change'] }, summary: { type: 'string' }, ttl: { type: 'string' } }, required: ['key', 'change', 'summary'] } } } },
+                secret_changes: { type: 'object', description: 'Per AWS Secrets Manager key. Names only, NEVER values.', properties: { none: { type: 'string', description: 'Why nothing changes here (when items is empty)' }, items: { type: 'array', items: { type: 'object', properties: { secret: { type: 'string', description: 'secret name' }, key: { type: 'string', description: 'key inside the secret' }, change: { type: 'string', enum: ['add', 'update', 'remove', 'rotate'] }, summary: { type: 'string' }, environments: { type: 'array', items: { type: 'string' } } }, required: ['secret', 'key', 'change', 'summary'] } } } },
+                infra_changes: { type: 'object', description: 'Helm chart/values, service metadata, Terraform, env config', properties: { none: { type: 'string', description: 'Why nothing changes here (when items is empty)' }, items: { type: 'array', items: { type: 'object', properties: { kind: { type: 'string', enum: ['helm', 'service_metadata', 'terraform', 'env_config', 'other'] }, target: { type: 'string', description: 'chart / values file / module / service' }, summary: { type: 'string' } }, required: ['kind', 'target', 'summary'] } } } },
+                telemetry_changes: { type: 'object', description: 'Alerts, metrics, logs, traces, dashboards to create or update', properties: { none: { type: 'string', description: 'Why nothing changes here (when items is empty)' }, items: { type: 'array', items: { type: 'object', properties: { kind: { type: 'string', enum: ['alert', 'metric', 'log', 'trace', 'dashboard'] }, name: { type: 'string' }, change: { type: 'string', enum: ['create', 'update', 'remove'] }, summary: { type: 'string' }, condition: { type: 'string', description: 'alerts: condition / threshold' } }, required: ['kind', 'name', 'change', 'summary'] } } } }
+              },
+              required: ['db_changes', 'cache_changes', 'secret_changes', 'infra_changes', 'telemetry_changes']
+            },
+            qa_plan: {
+              type: 'object',
+              description: 'Approval sheet, QA half (edge cases go in edge_cases).',
+              properties: {
+                test_cases: {
+                  type: 'array',
+                  description: 'Every acceptance criterion needs at least one test case (ac).',
+                  items: {
+                    type: 'object',
+                    properties: {
+                      id: { type: 'string', description: 'TC1, TC2 ...' },
+                      title: { type: 'string' },
+                      validates: { type: 'string', description: 'what this test proves' },
+                      type: { type: 'string', enum: ['unit', 'api', 'manual', 'e2e'] },
+                      ac: { type: 'string' },
+                      test: { type: 'string', description: 'test_plan name when automated' }
+                    },
+                    required: ['id', 'title', 'validates', 'type']
+                  }
+                },
+                must_not_happen: {
+                  type: 'array',
+                  description: 'Constraints: what must definitely NOT happen (e.g. double credit, money moved without a ledger row, PII in logs).',
+                  items: { type: 'object', properties: { id: { type: 'string', description: 'N1, N2 ...' }, text: { type: 'string' }, checked_by: { type: 'string' } }, required: ['id', 'text'] }
+                },
+                happy_cases: {
+                  type: 'array',
+                  description: 'What must definitely happen in the normal flow.',
+                  items: { type: 'object', properties: { id: { type: 'string', description: 'H1, H2 ...' }, text: { type: 'string' }, checked_by: { type: 'string' } }, required: ['id', 'text'] }
+                }
+              },
+              required: ['test_cases', 'must_not_happen', 'happy_cases']
+            }
           },
           required: ['gap_analysis', 'edge_cases']
         }
@@ -427,7 +479,7 @@ export class PlannerTools {
     let problems: string[];
     try {
       const plan = normalizePlan(raw, this.session.ticket);
-      problems = validatePlan(plan, this.session.repos.map((r) => r.id), { requireGapAnalysis: true });
+      problems = validatePlan(plan, this.session.repos.map((r) => r.id), { requireGapAnalysis: true, requireDevQaPlan: this.session.requireDevQaPlan });
     } catch (err) {
       problems = [err instanceof PlanParseError || err instanceof Error ? err.message : String(err)];
     }

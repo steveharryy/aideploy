@@ -1,3 +1,5 @@
+import type { CheckRow } from '../intake/ticket-template.js';
+import type { DevPlan, QaPlan } from './dev-qa-plan.js';
 /**
  * Planning phase contract.
  *
@@ -144,4 +146,12 @@ export interface TicketPlan {
   /** One entry per checklist item. When present, code (not the model) decides the readiness verdict. */
   gapAnalysis: GapEntry[];
   edgeCases: EdgeCase[];
+  /** Dev plan for approval: DB tables, cache keys, Secrets Manager keys, infra, alerts/telemetry. */
+  devPlan?: DevPlan;
+  /** QA plan for approval: test cases, what must not happen, happy cases (edge cases: edgeCases). */
+  qaPlan?: QaPlan;
+  /** Set by code: the intake checklist (basic checks + the standard ticket template), every row. */
+  intakeChecks?: CheckRow[];
+  /** Set by code when intake sends the ticket back: the template to copy into the description. */
+  templateText?: string;
 }

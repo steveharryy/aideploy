@@ -10,8 +10,15 @@ kill_switch: false
 coding:
   enabled: false
 
+# AI QA (AI Agent Jira Workflow): after coding, a separate QA agent (never edits code) verifies the
+# change against the acceptance criteria and the plan, with numbered findings F1, F2...
+# Defects go back to AI Dev automatically, at most max_loops times; then a person takes over.
+qa:
+  enabled: true
+  max_loops: 3
+
 # System prompt file: prompts/<prompt_version>.md (versioned in Git; logged with every plan)
-prompt_version: planning-v4
+prompt_version: planning-v5
 
 planning:
   # tools:    the agent can only use the planner tools (jira_read, list_repos, search_code,
@@ -38,6 +45,11 @@ intake:
   allowed_issue_types: [Bug, Story]
   max_story_points: 3             # tickets without an estimate pass
   assign_to_reporter: true        # when sending a ticket back
+  # Standard ticket template (config/ticket-template.yaml): every section is checked by code before
+  # planning; a ticket missing a required section goes back to the reporter with the full checklist
+  # and the template to copy. Check one ticket by hand: npm start -- --check-ticket T2-123
+  template: false
+  template_applies_from: ""       # YYYY-MM-DD: older tickets are not checked against the template
 
 # Per-project intake rules (override the defaults above). Current target: T2.
 # T2 has no Product field and no components; areas are tagged with labels (coin-sportsbook,
@@ -48,6 +60,8 @@ projects:
       require_product: false
       require_component: false      # turn on once T2 area labels are mapped in config/components.yaml
       allowed_issue_types: [Story, Task, Bug]   # not Request Tasks (access/infra requests), Epics or Sub-tasks
+      template: true
+      template_applies_from: "2026-11-18"
 
 jira:
   product_field: customfield_10224

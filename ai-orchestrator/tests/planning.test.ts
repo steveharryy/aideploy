@@ -233,8 +233,8 @@ describe('Planning: rendering', () => {
   const plan = normalizePlan({ ...readyJson, questions: [{ id: 'Q1', text: 'Which product?', options: ['SportsBull', 'All'], defaultOption: 'SportsBull' }] }, 'T2-1');
   it('plan text shows work items, ACs with verify method, tests and assumptions', () => {
     const text = renderPlan(normalizePlan(readyJson, 'T2-1'));
-    expect(text).toContain('W1  api  [confidence: high]');
-    expect(text).toContain('Repos   : api (W1, confidence high)');
+    expect(text).toContain('W1  api  [update · confidence high]');
+    expect(text).toMatch(/=== DEV PLAN ===\n1\. REPOS TO UPDATE OR CREATE/);
     expect(text).toContain('AC1 [W1] Tied ranks split evenly');
     expect(text).toContain('verify: unit_test');
     expect(text).toContain('test_AC1_tie_split');

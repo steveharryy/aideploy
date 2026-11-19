@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
 import { failingTests, newFailures } from '../src/util/test-failures.js';
 import { TestingAgent } from '../src/agents/testing/agent.js';
 
@@ -58,5 +60,33 @@ describe('TestingAgent re-test honours pre-existing failures', () => {
   it('no known failures → any failure blocks (unchanged behaviour)', async () => {
     const res = await agent(failing([' FAIL  a.test.ts > old'])).runTests(['r']);
     expect(res.overallSuccess).toBe(false);
+  });
+});
+
+describe('TestingAgent: flaky test retries (2)', () => {
+  const dir = process.cwd();
+  // A counter file makes the command fail on the first N runs.
+  const flaky = (counter: string, failRuns: number, lines: (n: number) => string[]) =>
+    `n=$(cat ${counter} 2>/dev/null || echo 0); n=$((n+1)); echo $n > ${counter}; if [ $n -le ${failRuns} ]; then case $n in ${[1, 2, 3].map((n) => `${n}) printf '%s\\n' ${[...lines(n), ' Test Files  1 failed (1)'].map((l) => `'${l}'`).join(' ')};;`).join(' ')} esac; exit 1; fi; echo ok`;
+  const agent = (cmd: string) => new TestingAgent({ repoPaths: { r: dir }, verifyCommands: () => [{ name: 'test', run: cmd }] });
+  const tmp = () => `${os.tmpdir()}/flaky-${Math.random().toString(36).slice(2)}`;
+
+  it('fails once, passes on retry → passes, marked [flaky]', async () => {
+    const res = await agent(flaky(tmp(), 1, () => [' FAIL  a.test.ts > timing'])).runTests(['r']);
+    expect(res.overallSuccess).toBe(true);
+    expect(res.repoResults[0].checks.at(-1)?.output).toMatch(/^\[flaky\] failed on the first run, passed on retry 1: a.test.ts > timing/);
+  });
+
+  it('the same test fails again → a real failure, no further retries', async () => {
+    const c = tmp();
+    const res = await agent(flaky(c, 3, () => [' FAIL  a.test.ts > real bug'])).runTests(['r']);
+    expect(res.overallSuccess).toBe(false);
+    expect(fs.readFileSync(c, 'utf-8').trim()).toBe('2');
+  });
+
+  it('different tests fail on each run → blocks, tagged [infra]', async () => {
+    const res = await agent(flaky(tmp(), 3, (n) => [` FAIL  a.test.ts > t${n}`])).runTests(['r']);
+    expect(res.overallSuccess).toBe(false);
+    expect(res.repoResults[0].checks.at(-1)?.error).toMatch(/^\[infra\] nondeterministic test failures/);
   });
 });
